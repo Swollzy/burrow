@@ -1,0 +1,856 @@
+#!/bin/bash
+# Burrow: run Windows programs and Windows Steam on a Mac, CrossOver style, on top of
+# Wine (LGPL) and DXMT. Burrow downloads those from their own projects at setup time
+# and never bundles them.
+#
+# Written for the bash 3.2 that ships with macOS: no associative arrays, no ${x,,},
+# no mapfile. Run `burrow help` for the commands.
+set -u
+
+BURROW_VERSION="0.1.0"
+
+# --- Paths and pinned downloads -------------------------------------------------------
+BURROW_HOME="${BURROW_HOME:-$HOME/Library/Application Support/Burrow}"
+ENGINES="$BURROW_HOME/engines"
+RUNTIMES="$BURROW_HOME/runtimes"
+BOTTLES="$BURROW_HOME/bottles"
+LIBRARY="$BURROW_HOME/library"
+LOGS="$BURROW_HOME/logs"
+CACHE="$BURROW_HOME/cache"
+SHORTCUTS="${BURROW_SHORTCUTS:-$HOME/Applications/Burrow}"
+here="$(cd "$(dirname "$0")" && pwd)"
+APPDIR="$(cd "$here/.." && pwd)"
+
+# Wine 11.18 is the version the turbo patches were tested against (Neutron, 2026-10).
+WINE_VERSION="${BURROW_WINE_VERSION:-11.18}"
+WINE_URL="${BURROW_WINE_URL:-https://github.com/Gcenx/macOS_Wine_builds/releases/download/$WINE_VERSION/wine-devel-$WINE_VERSION-osx64.tar.xz}"
+WINE_RELEASE_API="https://api.github.com/repos/Gcenx/macOS_Wine_builds/releases/tags/$WINE_VERSION"
+# DXMT v0.80 is the last MIT-licensed release (later ones are LGPL, which is fine too).
+DXMT_VERSION="${BURROW_DXMT_VERSION:-v0.80}"
+DXMT_URL="${BURROW_DXMT_URL:-https://github.com/3Shain/dxmt/releases/download/$DXMT_VERSION/dxmt-$DXMT_VERSION-builtin.tar.gz}"
+DXMT_RELEASE_API="https://api.github.com/repos/3Shain/dxmt/releases/tags/$DXMT_VERSION"
+STEAM_SETUP_URL="${BURROW_STEAM_URL:-https://cdn.cloudflare.steamstatic.com/client/installer/SteamSetup.exe}"
+STEAM_BOTTLE="Steam"
+STEAM_DIR_WIN='C:\Program Files (x86)\Steam'
+STEAM_REL="drive_c/Program Files (x86)/Steam"
+WRAPPER_MARKER="BURROW-WEBHELPER-WRAPPER-1"
+
+STOCK_ENGINE="wine-$WINE_VERSION"
+TURBO_ENGINE="wine-$WINE_VERSION-turbo"
+
+# --- Output -----------------------------------------------------------------------------
+if [ -t 1 ]; then B=$'\033[1m'; D=$'\033[2m'; R=$'\033[31m'; G=$'\033[32m'; Y=$'\033[33m'; N=$'\033[0m'
+else B=""; D=""; R=""; G=""; Y=""; N=""; fi
+say()  { printf '%s\n' "$*"; }
+step() { printf '%s==>%s %s\n' "$B" "$N" "$*"; }
+ok()   { printf '%s✓%s %s\n' "$G" "$N" "$*"; }
+warn() { printf '%s!%s %s\n' "$Y" "$N" "$*" >&2; }
+die()  { printf '%serror:%s %s\n' "$R" "$N" "$*" >&2; exit 1; }
+
+is_mac() { [ "$(uname -s)" = "Darwin" ]; }
+cpu_count() { sysctl -n hw.ncpu 2>/dev/null || nproc 2>/dev/null || echo 4; }
+
+# APFS clone on a Mac (nearly free), plain copy elsewhere.
+clone_tree() { if is_mac; then cp -c -R "$1" "$2" 2>/dev/null || cp -R "$1" "$2"; else cp -R "$1" "$2"; fi; }
+
+# Turns any text into a safe file name: "Schedule I" -> "schedule-i".
+slugify() {
+  printf '%s' "$1" | tr '[:upper:]' '[:lower:]' | tr -c 'a-z0-9' '-' | sed -e 's/--*/-/g' -e 's/^-//' -e 's/-$//'
+}
+
+# key=value files. Values are stored raw, one per line; read back with conf_get.
+conf_get() { # file key
+  [ -f "$1" ] || return 1
+  local line
+  line=$(grep -m1 "^$2=" "$1") || return 1
+  printf '%s' "${line#*=}"
+}
+conf_set() { # file key value
+  local tmp="$1.tmp.$$"
+  { [ -f "$1" ] && grep -v "^$2=" "$1"; printf '%s=%s\n' "$2" "$3"; } > "$tmp" && mv "$tmp" "$1"
+}
+
+download() { # url dest
+  local tmp="$2.part"
+  mkdir -p "$(dirname "$2")"
+  say "${D}  $1${N}"
+  curl -fL --retry 3 --retry-delay 2 --progress-bar -o "$tmp" "$1" || { rm -f "$tmp"; return 1; }
+  mv "$tmp" "$2"
+}
+
+# Asks GitHub for a release's asset URL matching a pattern, for when a pinned name moved.
+release_asset() { # api-url grep-pattern
+  curl -fsSL "$1" 2>/dev/null | grep -o '"browser_download_url": *"[^"]*"' | sed 's/.*"\(http[^"]*\)"$/\1/' | grep -E "$2" | head -1
+}
+
+# --- Engines (Wine builds) ----------------------------------------------------------------
+# BURROW_WINE points at any wine binary instead (used by the tests on Linux).
+engine_root() { printf '%s/%s' "$ENGINES" "$1"; }
+engine_wine() { # engine -> path of its wine binary
+  if [ -n "${BURROW_WINE:-}" ] && [ "$1" = "$STOCK_ENGINE" ]; then printf '%s' "$BURROW_WINE"; return; fi
+  local root; root=$(engine_root "$1")
+  if [ -x "$root/bin/wine" ]; then printf '%s' "$root/bin/wine"
+  elif [ -x "$root/bin/wine64" ]; then printf '%s' "$root/bin/wine64"
+  else return 1; fi
+}
+engine_wineserver() {
+  if [ -n "${BURROW_WINESERVER:-}" ]; then printf '%s' "$BURROW_WINESERVER"; return; fi
+  if [ -n "${BURROW_WINE:-}" ] && [ "$1" = "$STOCK_ENGINE" ]; then
+    local d; d=$(dirname "$BURROW_WINE")
+    if [ -x "$d/wineserver" ]; then printf '%s' "$d/wineserver"; else command -v wineserver; fi
+    return
+  fi
+  printf '%s/bin/wineserver' "$(engine_root "$1")"
+}
+engine_ok() { engine_wine "$1" >/dev/null 2>&1; }
+best_engine() { if engine_ok "$TURBO_ENGINE"; then echo "$TURBO_ENGINE"; else echo "$STOCK_ENGINE"; fi; }
+
+# --- Bottles (one Windows install each) ------------------------------------------------------
+bottle_dir()    { printf '%s/%s' "$BOTTLES" "$1"; }
+bottle_prefix() { printf '%s/%s/prefix' "$BOTTLES" "$1"; }
+bottle_conf()   { printf '%s/%s/bottle.conf' "$BOTTLES" "$1"; }
+bottle_exists() { [ -d "$(bottle_prefix "$1")/drive_c" ]; }
+
+bottle_engine() { # bottle -> engine it should run on now
+  local e; e=$(conf_get "$(bottle_conf "$1")" engine 2>/dev/null) || e=auto
+  if [ "$e" = auto ]; then best_engine; else echo "$e"; fi
+}
+
+# Exports the environment for running Wine in a bottle. Sets WINE and WINESERVER.
+use_bottle() { # bottle [graphics]
+  local bottle="$1" graphics="${2:-auto}" engine
+  engine=$(bottle_engine "$bottle")
+  case "$graphics" in
+    turbo|dxmt) engine_ok "$TURBO_ENGINE" || die "turbo graphics isn't built yet; run: burrow turbo"; engine="$TURBO_ENGINE" ;;
+    compat|wined3d) engine="$STOCK_ENGINE" ;;
+    auto|"") ;;
+    *) die "unknown graphics mode '$graphics' (use auto, turbo or compat)" ;;
+  esac
+  WINE=$(engine_wine "$engine") || die "Wine isn't set up yet; run: burrow setup"
+  WINESERVER=$(engine_wineserver "$engine")
+  export WINEPREFIX; WINEPREFIX=$(bottle_prefix "$bottle")
+  export WINEDEBUG="${BURROW_WINEDEBUG:--all}"
+  export WINEMSYNC=1                 # Mach-semaphore sync; builds without it ignore this
+  export MVK_CONFIG_LOG_LEVEL=1      # MoltenVK: errors only
+  [ "${BURROW_HUD:-0}" = 1 ] && export MTL_HUD_ENABLED=1
+  # Stock Wine draws D3D11 with its own OpenGL path; force builtin so DLLs a game or
+  # installer dropped into the bottle can't take over. Turbo's builtins are DXMT.
+  local overrides="d3d11,dxgi,d3d10core=b"
+  [ "$engine" = "$TURBO_ENGINE" ] && overrides="$overrides;winemetal=b"
+  local extra; extra=$(conf_get "$(bottle_conf "$bottle")" dlloverrides 2>/dev/null) || extra=""
+  export WINEDLLOVERRIDES="$overrides${extra:+;$extra}"
+  if [ -d /Library/Frameworks/GStreamer.framework/Libraries ] && is_mac; then
+    # In-game videos (Unity/Unreal intros) play through Wine's GStreamer bridge.
+    export GST_PLUGIN_SYSTEM_PATH_1_0=/Library/Frameworks/GStreamer.framework/Libraries/gstreamer-1.0
+    export DYLD_FALLBACK_LIBRARY_PATH="/Library/Frameworks/GStreamer.framework/Libraries${DYLD_FALLBACK_LIBRARY_PATH:+:$DYLD_FALLBACK_LIBRARY_PATH}"
+  fi
+  # A bottle that switched engines needs its system folder refreshed (DXMT's winemetal.dll
+  # is copied into system32 by wineboot).
+  local conf; conf=$(bottle_conf "$bottle")
+  if [ "$(conf_get "$conf" last_engine 2>/dev/null)" != "$engine" ] && [ -d "$WINEPREFIX/drive_c" ]; then
+    "$WINE" wineboot -u >/dev/null 2>&1
+    "$WINESERVER" -w 2>/dev/null
+    conf_set "$conf" last_engine "$engine"
+  fi
+  BOTTLE_ENGINE="$engine"
+}
+
+new_log() { # name -> log path (keeps the newest 20 per name)
+  mkdir -p "$LOGS"
+  local base; base=$(slugify "$1")
+  ls -1t "$LOGS/$base"-*.log 2>/dev/null | tail -n +20 | while IFS= read -r old; do rm -f "$old"; done
+  printf '%s/%s-%s.log' "$LOGS" "$base" "$(date +%Y%m%d-%H%M%S)"
+}
+
+cmd_bottle_create() { # name
+  local name="$1" dir
+  [ -n "$name" ] || die "give the bottle a name"
+  case "$name" in */*|.*) die "bottle names can't contain / or start with ." ;; esac
+  dir=$(bottle_dir "$name")
+  if bottle_exists "$name"; then ok "Bottle '$name' already exists"; return 0; fi
+  mkdir -p "$dir"
+  [ -f "$(bottle_conf "$name")" ] || printf 'engine=auto\n' > "$(bottle_conf "$name")"
+  use_bottle "$name"
+  step "Creating bottle '$name' (a fresh Windows 10 folder)…"
+  "$WINE" wineboot -i >/dev/null 2>&1
+  "$WINESERVER" -w 2>/dev/null
+  [ -d "$WINEPREFIX/drive_c" ] || die "Wine couldn't create the bottle; try: BURROW_WINEDEBUG=err+all burrow bottle new '$name'"
+  "$WINE" reg add 'HKCU\Software\Wine' /v Version /t REG_SZ /d win10 /f >/dev/null 2>&1
+  # Keep macOS shortcuts like Cmd-Q and Cmd-H working, and let Option act as Alt for games.
+  "$WINE" reg add 'HKCU\Software\Wine\Mac Driver' /v LeftOptionIsAlt /t REG_SZ /d y /f >/dev/null 2>&1
+  "$WINE" reg add 'HKCU\Software\Wine\Mac Driver' /v RightOptionIsAlt /t REG_SZ /d y /f >/dev/null 2>&1
+  "$WINESERVER" -w 2>/dev/null
+  conf_set "$(bottle_conf "$name")" last_engine "$BOTTLE_ENGINE"
+  ok "Bottle '$name' is ready"
+}
+
+cmd_bottle() {
+  local sub="${1:-list}"; shift || true
+  case "$sub" in
+    new|create) cmd_bottle_create "${1:-}" ;;
+    list|ls)
+      [ -d "$BOTTLES" ] || { say "No bottles yet."; return 0; }
+      local d n
+      for d in "$BOTTLES"/*/; do
+        [ -d "$d" ] || continue
+        n=$(basename "$d")
+        printf '%-20s engine: %s\n' "$n" "$(bottle_engine "$n")"
+      done ;;
+    delete|rm)
+      local name="${1:-}"; [ -n "$name" ] || die "which bottle?"
+      bottle_exists "$name" || [ -d "$(bottle_dir "$name")" ] || die "no bottle named '$name'"
+      if [ "${2:-}" != "--yes" ]; then
+        printf 'Delete bottle %s and everything installed in it? Type its name to confirm: ' "$name"
+        local answer; read -r answer; [ "$answer" = "$name" ] || die "not deleted"
+      fi
+      ( use_bottle "$name" && "$WINESERVER" -k ) >/dev/null 2>&1
+      rm -rf "$(bottle_dir "$name")"
+      grep -l "^bottle=$name\$" "$LIBRARY"/*.app.conf 2>/dev/null | while IFS= read -r f; do rm -f "$f"; done
+      ok "Deleted bottle '$name'" ;;
+    engine)
+      local name="${1:-}" e="${2:-}"; bottle_exists "$name" || die "no bottle named '$name'"
+      case "$e" in auto|turbo) e=auto ;; compat|stock) e="$STOCK_ENGINE" ;; *) die "use: burrow bottle engine <bottle> auto|compat" ;; esac
+      conf_set "$(bottle_conf "$name")" engine "$e"; ok "Bottle '$name' now uses: $e" ;;
+    *) die "unknown: burrow bottle $sub (new, list, delete, engine)" ;;
+  esac
+}
+
+# --- Setup ---------------------------------------------------------------------------------------
+check_mac() {
+  is_mac || { warn "not a Mac; only the tests run here"; return 0; }
+  local major; major=$(sw_vers -productVersion | cut -d. -f1)
+  [ "$major" -ge 11 ] || die "Burrow needs macOS 11 or newer (this is $(sw_vers -productVersion))"
+  if [ "$(uname -m)" = arm64 ]; then
+    if ! /usr/bin/arch -x86_64 /usr/bin/true 2>/dev/null; then
+      step "Installing Rosetta 2 (Apple's Intel translator; Wine needs it)…"
+      softwareupdate --install-rosetta --agree-to-license || die "Rosetta didn't install; run: softwareupdate --install-rosetta"
+    fi
+    ok "Apple Silicon with Rosetta 2"
+  else
+    warn "Intel Mac: Windows programs will run, but turbo graphics (DXMT) needs Apple Silicon"
+  fi
+}
+
+install_wine() {
+  local root; root=$(engine_root "$STOCK_ENGINE")
+  if engine_ok "$STOCK_ENGINE"; then ok "Wine $WINE_VERSION is installed"; return 0; fi
+  step "Downloading Wine $WINE_VERSION (Gcenx's macOS build of the open source Wine project)…"
+  local tar="$CACHE/wine-devel-$WINE_VERSION-osx64.tar.xz"
+  if [ ! -f "$tar" ]; then
+    download "$WINE_URL" "$tar" || {
+      local url; url=$(release_asset "$WINE_RELEASE_API" 'wine-devel-.*osx64\.tar\.xz$')
+      [ -n "$url" ] || die "couldn't download Wine $WINE_VERSION"
+      download "$url" "$tar" || die "couldn't download Wine $WINE_VERSION"
+    }
+  fi
+  local tmp="$ENGINES/.extract.$$"
+  rm -rf "$tmp"; mkdir -p "$tmp"
+  tar -xJf "$tar" -C "$tmp" || { rm -rf "$tmp"; rm -f "$tar"; die "the Wine download was damaged; run setup again"; }
+  # The archive holds "Wine Devel.app/Contents/Resources/wine"; find the folder with bin/wine.
+  local found
+  found=$(find "$tmp" -type f \( -path '*/bin/wine' -o -path '*/bin/wine64' \) 2>/dev/null | head -1)
+  [ -n "$found" ] || { rm -rf "$tmp"; die "no wine program in the download"; }
+  rm -rf "$root"
+  mv "$(dirname "$(dirname "$found")")" "$root"
+  rm -rf "$tmp"
+  is_mac && xattr -dr com.apple.quarantine "$root" 2>/dev/null
+  engine_ok "$STOCK_ENGINE" || die "Wine didn't install correctly"
+  ok "Wine $WINE_VERSION installed"
+}
+
+install_dxmt() {
+  local dest="$RUNTIMES/dxmt-$DXMT_VERSION"
+  if [ -d "$dest/x86_64-windows" ]; then ok "DXMT $DXMT_VERSION is downloaded"; return 0; fi
+  step "Downloading DXMT $DXMT_VERSION (Direct3D 11 to Metal)…"
+  local tgz="$CACHE/dxmt-$DXMT_VERSION-builtin.tar.gz"
+  if [ ! -f "$tgz" ]; then
+    download "$DXMT_URL" "$tgz" || {
+      local url; url=$(release_asset "$DXMT_RELEASE_API" 'builtin.*\.tar\.gz$|\.tar\.gz$')
+      [ -n "$url" ] || die "couldn't download DXMT"
+      download "$url" "$tgz" || die "couldn't download DXMT"
+    }
+  fi
+  local tmp="$RUNTIMES/.extract.$$"
+  rm -rf "$tmp"; mkdir -p "$tmp"
+  tar -xzf "$tgz" -C "$tmp" || { rm -rf "$tmp"; rm -f "$tgz"; die "the DXMT download was damaged; run setup again"; }
+  local win; win=$(find "$tmp" -type d -name x86_64-windows | head -1)
+  [ -n "$win" ] || { rm -rf "$tmp"; die "unexpected DXMT archive layout"; }
+  rm -rf "$dest"; mv "$(dirname "$win")" "$dest"; rm -rf "$tmp"
+  ok "DXMT $DXMT_VERSION downloaded"
+}
+
+cmd_setup() {
+  step "Burrow $BURROW_VERSION setup"
+  mkdir -p "$ENGINES" "$RUNTIMES" "$BOTTLES" "$LIBRARY" "$LOGS" "$CACHE"
+  check_mac
+  if [ -n "${BURROW_WINE:-}" ]; then ok "Using $BURROW_WINE"; else install_wine; fi
+  install_dxmt
+  if is_mac && [ ! -d /Library/Frameworks/GStreamer.framework ]; then
+    warn "Optional: install GStreamer so in-game videos play (otherwise intros may be black):"
+    warn "  https://gstreamer.freedesktop.org/download/#macos  (the 'runtime installer' .pkg)"
+  fi
+  if engine_ok "$TURBO_ENGINE"; then ok "Turbo graphics is built"
+  else say ""; say "Next: ${B}burrow turbo${N} builds the fast Metal graphics most 3D games need (one time, a few minutes)."; fi
+  say "Then: ${B}burrow steam${N} installs and opens Windows Steam."
+}
+
+# --- Turbo graphics: a DXMT-capable copy of Wine ---------------------------------------------
+# DXMT draws through functions in Wine's Mac driver that stock builds keep private, so the
+# driver (and a few DLLs games trip over) is rebuilt from the matching Wine source with the
+# patches in engine/wine-patches (from Neutron, MIT; the patches are LGPL like Wine). Only
+# those files are compiled, then DXMT's DLLs are laid over a clone of the stock engine.
+cmd_turbo() {
+  is_mac || [ "${BURROW_TURBO_ANYWHERE:-0}" = 1 ] || die "turbo graphics is built on the Mac itself"
+  engine_ok "$STOCK_ENGINE" || cmd_setup
+  install_dxmt
+  if [ "${1:-}" != "--rebuild" ] && engine_ok "$TURBO_ENGINE"; then ok "Turbo graphics is already built (burrow turbo --rebuild to redo it)"; return 0; fi
+  [ "$(uname -m)" = arm64 ] || warn "DXMT needs Apple Silicon; building anyway"
+
+  step "Checking build tools…"
+  if ! xcode-select -p >/dev/null 2>&1; then
+    xcode-select --install 2>/dev/null
+    die "install Apple's Command Line Tools in the window that just opened, then run: burrow turbo"
+  fi
+  local brew=""
+  for b in /opt/homebrew/bin/brew /usr/local/bin/brew; do [ -x "$b" ] && brew="$b" && break; done
+  if [ -z "$brew" ]; then
+    say "Turbo needs Homebrew (free, from brew.sh) for three build tools. Install it with:"
+    say '  /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"'
+    die "then run: burrow turbo"
+  fi
+  local bp; bp=$("$brew" --prefix)
+  local need=""
+  [ -x "$bp/opt/bison/bin/bison" ] || need="$need bison"
+  [ -x "$bp/opt/flex/bin/flex" ] || need="$need flex"
+  command -v x86_64-w64-mingw32-gcc >/dev/null 2>&1 || [ -x "$bp/bin/x86_64-w64-mingw32-gcc" ] || need="$need mingw-w64"
+  if [ -n "$need" ]; then
+    step "Installing build tools with Homebrew:$need"
+    # shellcheck disable=SC2086
+    "$brew" install $need || die "Homebrew couldn't install:$need"
+  fi
+  export PATH="$bp/opt/bison/bin:$bp/opt/flex/bin:$bp/bin:$PATH"
+
+  local stock wine version work src build patches
+  stock=$(engine_root "$STOCK_ENGINE"); wine=$(engine_wine "$STOCK_ENGINE")
+  version=$("$wine" --version 2>/dev/null | sed -n 's/^wine-\([0-9][0-9.]*\).*/\1/p')
+  [ -n "$version" ] || die "couldn't read the Wine version"
+  local major=${version%%.*} series
+  case "$version" in *.0) series="$major.0" ;; *) series="$major.x" ;; esac
+  work="$CACHE/turbo"; src="$work/wine-$version"; build="$work/build-$version"; patches="$APPDIR/engine/wine-patches"
+  mkdir -p "$work"
+  local applied="$src/.burrow-patches"
+  if [ -d "$src" ] && [ ! -f "$applied" ]; then rm -rf "$src"; fi
+  if [ ! -d "$src" ]; then
+    [ -f "$work/wine-$version.tar.xz" ] || { step "Downloading the Wine $version source…"; download "https://dl.winehq.org/wine/source/$series/wine-$version.tar.xz" "$work/wine-$version.tar.xz" || die "couldn't download the Wine source"; }
+    tar -xJf "$work/wine-$version.tar.xz" -C "$work" || die "couldn't unpack the Wine source"
+    : > "$applied"
+  fi
+  local p name
+  for p in "$patches"/*.patch; do
+    name=$(basename "$p")
+    grep -qx "$name" "$applied" && continue
+    (cd "$src" && patch -p1 --forward --quiet < "$p") || die "patch $name doesn't fit Wine $version (the patches were tested on 11.18)"
+    echo "$name" >> "$applied"
+  done
+
+  mkdir -p "$build"
+  export MACOSX_DEPLOYMENT_TARGET=10.15
+  if [ ! -f "$build/Makefile" ]; then
+    step "Configuring the Wine build (a few minutes)…"
+    (cd "$build" && "$src/configure" CC="clang -arch x86_64" OBJC="clang -arch x86_64" \
+      --host=x86_64-apple-darwin --enable-archs=i386,x86_64 --disable-tests \
+      --without-x --without-freetype --without-gstreamer --without-sdl --without-gnutls \
+      --without-cups --without-sane --without-gphoto --without-ffmpeg --without-krb5 \
+      --without-netapi --without-pcap --without-usb --without-inotify --without-capi \
+      --without-v4l2 --without-wayland > configure.log 2>&1) \
+      || { rm -f "$build/Makefile"; die "configure failed; see $build/configure.log"; }
+  fi
+  local pe_dlls n pe_targets=""
+  pe_dlls=$(cd "$src/dlls" && ls -d d3dx9_* xaudio2_* xactengine* bcrypt opengl32)
+  for n in $pe_dlls; do pe_targets="$pe_targets dlls/$n/i386-windows/$n.dll dlls/$n/x86_64-windows/$n.dll"; done
+  step "Compiling the patched Mac driver and DLLs…"
+  # shellcheck disable=SC2086
+  make -C "$build" -j"$(cpu_count)" dlls/winemac.drv/winemac.so dlls/mfreadwrite/x86_64-windows/mfreadwrite.dll $pe_targets \
+    > "$build/make.log" 2>&1 || die "build failed; see $build/make.log"
+  nm -gU "$build/dlls/winemac.drv/winemac.so" | grep -q " _macdrv_functions$" || die "the patched driver doesn't export what DXMT needs"
+
+  step "Assembling the turbo engine…"
+  local out; out=$(engine_root "$TURBO_ENGINE")
+  rm -rf "$out.new"; clone_tree "$stock" "$out.new" || die "couldn't copy the engine"
+  cp "$build/dlls/winemac.drv/winemac.so" "$out.new/lib/wine/x86_64-unix/winemac.so"
+  x86_64-w64-mingw32-strip -o "$out.new/lib/wine/x86_64-windows/mfreadwrite.dll" "$build/dlls/mfreadwrite/x86_64-windows/mfreadwrite.dll"
+  for n in $pe_dlls; do
+    i686-w64-mingw32-strip -o "$out.new/lib/wine/i386-windows/$n.dll" "$build/dlls/$n/i386-windows/$n.dll"
+    x86_64-w64-mingw32-strip -o "$out.new/lib/wine/x86_64-windows/$n.dll" "$build/dlls/$n/x86_64-windows/$n.dll"
+  done
+  overlay_dxmt "$out.new"
+  rm -rf "$out"; mv "$out.new" "$out"
+  ok "Turbo graphics built. Bottles on 'auto' use it from now on."
+}
+
+overlay_dxmt() { # engine-root
+  local dx="$RUNTIMES/dxmt-$DXMT_VERSION" arch f
+  for arch in x86_64-windows i386-windows x86_64-unix; do
+    [ -d "$dx/$arch" ] || continue
+    for f in "$dx/$arch"/*; do [ -f "$f" ] && cp "$f" "$1/lib/wine/$arch/"; done
+  done
+}
+
+# --- Library: programs you launch ----------------------------------------------------------------
+lib_file() { printf '%s/%s.app.conf' "$LIBRARY" "$1"; }
+
+# Adds a program to the library. target is a Windows path (C:\...), a .lnk or .exe in the bottle.
+lib_add() { # name bottle target [args]
+  local name="$1" bottle="$2" target="$3" args="${4:-}" id f
+  id=$(slugify "$name"); [ -n "$id" ] || id="app"
+  f=$(lib_file "$id")
+  mkdir -p "$LIBRARY"
+  { printf 'name=%s\n' "$name"; printf 'bottle=%s\n' "$bottle"; printf 'target=%s\n' "$target"
+    printf 'args=%s\n' "$args"; printf 'graphics=auto\n'; } > "$f"
+  printf '%s' "$id"
+}
+
+# Finds an app by id or by name (case-insensitive).
+lib_find() {
+  local q="$1" f id
+  [ -f "$(lib_file "$q")" ] && { printf '%s' "$q"; return 0; }
+  id=$(slugify "$q"); [ -f "$(lib_file "$id")" ] && { printf '%s' "$id"; return 0; }
+  for f in "$LIBRARY"/*.app.conf; do
+    [ -f "$f" ] || continue
+    if [ "$(conf_get "$f" name | tr '[:upper:]' '[:lower:]')" = "$(printf '%s' "$q" | tr '[:upper:]' '[:lower:]')" ]; then
+      basename "$f" .app.conf; return 0
+    fi
+  done
+  return 1
+}
+
+cmd_apps() {
+  local f any=0
+  if [ "${1:-}" = "--plain" ]; then
+    # For Burrow.app: "id<TAB>name" per line.
+    for f in "$LIBRARY"/*.app.conf; do
+      [ -f "$f" ] && printf '%s\t%s\n' "$(basename "$f" .app.conf)" "$(conf_get "$f" name)"
+    done
+    return 0
+  fi
+  for f in "$LIBRARY"/*.app.conf; do
+    [ -f "$f" ] || continue; any=1
+    printf '%-28s %s(%s)%s\n' "$(conf_get "$f" name)" "$D" "$(conf_get "$f" bottle)" "$N"
+  done
+  [ "$any" = 1 ] || say "Your library is empty. Install something with: burrow install <setup.exe>"
+  return 0
+}
+
+# Lists Start Menu and Desktop shortcuts in a bottle, one path per line.
+list_shortcuts() { # prefix
+  find "$1/drive_c/ProgramData/Microsoft/Windows/Start Menu" \
+       "$1/drive_c/users" \
+       -iname '*.lnk' 2>/dev/null | grep -v '/AppData/Roaming/Microsoft/Internet Explorer/' | sort
+}
+
+# Unix path in a bottle -> C:\ path.
+win_path() { # prefix unix-path
+  local rel="${2#"$1"/drive_c/}"
+  printf 'C:\\%s' "$(printf '%s' "$rel" | tr '/' '\\')"
+}
+
+cmd_install() { # installer [--bottle B] [--name N]
+  local installer="" bottle="" name=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --bottle) bottle="${2:-}"; shift 2 ;;
+      --name) name="${2:-}"; shift 2 ;;
+      *) installer="$1"; shift ;;
+    esac
+  done
+  [ -n "$installer" ] || die "usage: burrow install <setup.exe or .msi> [--bottle NAME] [--name NAME]"
+  case "$installer" in
+    http://*|https://*)
+      local fname; fname=$(basename "${installer%%\?*}"); [ -n "$fname" ] || fname=setup.exe
+      download "$installer" "$CACHE/downloads/$fname" || die "couldn't download $installer"
+      installer="$CACHE/downloads/$fname" ;;
+  esac
+  [ -f "$installer" ] || die "no such file: $installer"
+  local base; base=$(basename "$installer"); base="${base%.*}"
+  [ -n "$bottle" ] || bottle="${name:-$base}"
+  bottle_exists "$bottle" || cmd_bottle_create "$bottle"
+  use_bottle "$bottle"
+
+  local before after log; before="$CACHE/lnk-before.$$"; after="$CACHE/lnk-after.$$"
+  list_shortcuts "$WINEPREFIX" > "$before"
+  log=$(new_log "install-$base")
+  step "Running $(basename "$installer") in bottle '$bottle'. Finish the installer's windows; Burrow waits."
+  case "$installer" in
+    *.msi|*.MSI) "$WINE" msiexec /i "$installer" >"$log" 2>&1 ;;
+    *) (cd "$(dirname "$installer")" && "$WINE" "$installer" >"$log" 2>&1) ;;
+  esac
+  "$WINESERVER" -w 2>/dev/null
+  list_shortcuts "$WINEPREFIX" > "$after"
+
+  local added=0 lnk n id
+  while IFS= read -r lnk; do
+    [ -n "$lnk" ] || continue
+    n=$(basename "$lnk" .lnk)
+    case "$(printf '%s' "$n" | tr '[:upper:]' '[:lower:]')" in
+      *uninstall*|*readme*|*"read me"*|*help*|*manual*|*website*|*license*) continue ;;
+    esac
+    id=$(lib_add "$n" "$bottle" "$(win_path "$WINEPREFIX" "$lnk")")
+    ok "Added to your library: $n"
+    added=$((added + 1))
+  done < <(comm -13 "$before" "$after")
+  rm -f "$before" "$after"
+  if [ "$added" = 0 ]; then
+    warn "The installer made no shortcuts. Add the program yourself:"
+    warn "  burrow add \"Name\" --bottle '$bottle' --exe 'C:\\Path\\To\\Program.exe'"
+  fi
+  return 0
+}
+
+cmd_add() { # name --bottle B --exe PATH [--args A]
+  local name="${1:-}" bottle="" exe="" args=""
+  shift || true
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --bottle) bottle="${2:-}"; shift 2 ;;
+      --exe) exe="${2:-}"; shift 2 ;;
+      --args) args="${2:-}"; shift 2 ;;
+      *) die "unknown option $1" ;;
+    esac
+  done
+  [ -n "$name" ] && [ -n "$bottle" ] && [ -n "$exe" ] || die "usage: burrow add NAME --bottle BOTTLE --exe 'C:\\...\\program.exe' [--args '...']"
+  bottle_exists "$bottle" || die "no bottle named '$bottle'"
+  case "$exe" in /*) use_bottle "$bottle"; exe=$(win_path "$WINEPREFIX" "$exe") ;; esac
+  lib_add "$name" "$bottle" "$exe" "$args" >/dev/null
+  ok "Added $name"
+}
+
+cmd_remove() {
+  local id name; id=$(lib_find "${1:-}") || die "no app called '${1:-}' (see: burrow apps)"
+  name=$(conf_get "$(lib_file "$id")" name)
+  rm -f "$(lib_file "$id")"
+  [ -n "$name" ] && rm -rf "$SHORTCUTS/$(printf '%s' "$name" | tr '/:' '--').app"
+  ok "Removed $1 from the library (it's still installed in its bottle)"
+}
+
+cmd_launch() { # app [--graphics G] [-- extra args]
+  local q="${1:-}"; shift || true
+  local graphics="" extra=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --graphics) graphics="${2:-}"; shift 2 ;;
+      --) shift; extra="$*"; break ;;
+      *) extra="$extra $1"; shift ;;
+    esac
+  done
+  local id f; id=$(lib_find "$q") || die "no app called '$q' (see: burrow apps)"
+  f=$(lib_file "$id")
+  local name bottle target args
+  name=$(conf_get "$f" name); bottle=$(conf_get "$f" bottle); target=$(conf_get "$f" target)
+  args=$(conf_get "$f" args); [ -n "$graphics" ] || graphics=$(conf_get "$f" graphics)
+  if [ "$bottle" = "$STEAM_BOTTLE" ] && [ "$(conf_get "$f" steam_appid 2>/dev/null)" != "" ]; then
+    cmd_steam_play "$(conf_get "$f" steam_appid)"; return
+  fi
+  use_bottle "$bottle" "$graphics"
+  local log; log=$(new_log "$name")
+  { echo "burrow $BURROW_VERSION launch '$name' on $BOTTLE_ENGINE"; env | grep -E '^(WINE|DYLD|GST|MTL|MVK)' ; } > "$log"
+  step "Starting $name ($BOTTLE_ENGINE)…  log: $log"
+  # `start /wait` follows .lnk shortcuts and sets the program's own folder as the working dir.
+  # shellcheck disable=SC2086
+  "$WINE" start /wait "$target" $args $extra >>"$log" 2>&1 &
+  [ "${BURROW_FOREGROUND:-0}" = 1 ] && wait
+  return 0
+}
+
+cmd_run() { # bottle exe [args...]
+  local bottle="${1:-}"; shift || true
+  [ $# -gt 0 ] || die "usage: burrow run <bottle> <program.exe> [args]"
+  bottle_exists "$bottle" || cmd_bottle_create "$bottle"
+  use_bottle "$bottle"
+  "$WINE" "$@"
+}
+
+# --- Steam ----------------------------------------------------------------------------------------
+steam_root() { printf '%s/%s' "$(bottle_prefix "$STEAM_BOTTLE")" "$STEAM_REL"; }
+
+# Puts Burrow's wrapper in front of every steamwebhelper.exe. Steam replaces the file when it
+# updates, so this runs before each launch and keeps watching while Steam is open.
+wrap_webhelpers() { # quiet?
+  local root wrapper f dir changed=0
+  root=$(steam_root); wrapper="$APPDIR/wrapper/steamwebhelper.exe"
+  [ -f "$wrapper" ] || die "missing $wrapper (re-download Burrow)"
+  while IFS= read -r f; do
+    [ -n "$f" ] || continue
+    grep -aq "$WRAPPER_MARKER" "$f" 2>/dev/null && continue
+    dir=$(dirname "$f")
+    mv -f "$f" "$dir/steamwebhelper_real.exe" && cp "$wrapper" "$f" && changed=1
+  done < <(find "$root/bin/cef" -name steamwebhelper.exe 2>/dev/null)
+  [ "$changed" = 1 ] && [ -z "${1:-}" ] && ok "Applied the Steam window fix"
+  return 0
+}
+
+watch_webhelpers() { # runs in the background until the bottle's wineserver exits
+  local done_flag="$1"
+  while [ ! -f "$done_flag" ]; do wrap_webhelpers quiet; sleep 2; done
+  rm -f "$done_flag"
+}
+
+cmd_steam_install() {
+  bottle_exists "$STEAM_BOTTLE" || cmd_bottle_create "$STEAM_BOTTLE"
+  use_bottle "$STEAM_BOTTLE"
+  if [ -f "$(steam_root)/steam.exe" ] || [ -f "$(steam_root)/Steam.exe" ]; then ok "Windows Steam is installed"; return 0; fi
+  local setup="$CACHE/SteamSetup.exe"
+  step "Downloading Steam's Windows installer from Valve…"
+  download "$STEAM_SETUP_URL" "$setup" || die "couldn't download SteamSetup.exe"
+  step "Installing Windows Steam…"
+  "$WINE" "$setup" /S >"$(new_log steam-install)" 2>&1
+  "$WINESERVER" -w 2>/dev/null
+  [ -f "$(steam_root)/steam.exe" ] || [ -f "$(steam_root)/Steam.exe" ] || die "Steam didn't install; see the log in $LOGS"
+  # Steam adds itself to Windows startup; Wine would then start it without our fixes.
+  "$WINE" reg delete 'HKCU\Software\Microsoft\Windows\CurrentVersion\Run' /v Steam /f >/dev/null 2>&1
+  "$WINESERVER" -w 2>/dev/null
+  ok "Windows Steam installed"
+}
+
+steam_exe_win() { if [ -f "$(steam_root)/Steam.exe" ]; then printf '%s\\Steam.exe' "$STEAM_DIR_WIN"; else printf '%s\\steam.exe' "$STEAM_DIR_WIN"; fi; }
+
+steam_running() { [ -f "$BOTTLES/$STEAM_BOTTLE/.steam-running" ] && kill -0 "$(cat "$BOTTLES/$STEAM_BOTTLE/.steam-running")" 2>/dev/null; }
+
+cmd_steam_open() { # [extra steam args]
+  cmd_steam_install
+  use_bottle "$STEAM_BOTTLE" "${BURROW_STEAM_GRAPHICS:-auto}"
+  if steam_running; then
+    # Hand the request to the running Steam (it forwards -applaunch etc. to itself).
+    "$WINE" "$(steam_exe_win)" "$@" >/dev/null 2>&1 &
+    return 0
+  fi
+  [ "$BOTTLE_ENGINE" = "$TURBO_ENGINE" ] || warn "Turbo graphics isn't built, so 3D games will be slow or fail. Run: burrow turbo"
+  wrap_webhelpers
+  local log flag; log=$(new_log steam); flag="$BOTTLES/$STEAM_BOTTLE/.steam-closed"
+  rm -f "$flag"
+  step "Opening Windows Steam ($BOTTLE_ENGINE). The first start updates Steam; if it closes, run burrow steam again."
+  (
+    watch_webhelpers "$flag" &
+    # -no-cef-sandbox: Chromium's sandbox doesn't work under Wine.
+    "$WINE" "$(steam_exe_win)" -no-cef-sandbox "$@" >"$log" 2>&1
+    "$WINESERVER" -w 2>/dev/null
+    : > "$flag"
+    rm -f "$BOTTLES/$STEAM_BOTTLE/.steam-running"
+  ) &
+  echo $! > "$BOTTLES/$STEAM_BOTTLE/.steam-running"
+  [ "${BURROW_FOREGROUND:-0}" = 1 ] && wait
+  return 0
+}
+
+# Prints "appid<TAB>name<TAB>installdir" for each installed Steam game.
+steam_games() {
+  local root f lib libs
+  root=$(steam_root)
+  libs=$(cd -P "$root/steamapps" 2>/dev/null && pwd) || return 0
+  # Extra library folders: "path" "C:\\Games\\SteamLibrary" in libraryfolders.vdf.
+  if [ -f "$root/steamapps/libraryfolders.vdf" ]; then
+    while IFS= read -r lib; do
+      lib=$(printf '%s' "$lib" | sed 's/\\\\/\\/g')
+      case "$lib" in [A-Za-z]:\\*) ;; *) continue ;; esac
+      local drive; drive=$(printf '%s' "${lib%%:*}" | tr '[:upper:]' '[:lower:]')
+      local rest; rest=$(printf '%s' "${lib#?:\\}" | tr '\\' '/')
+      local unix real
+      unix="$(bottle_prefix "$STEAM_BOTTLE")/dosdevices/$drive:/$rest/steamapps"
+      real=$(cd -P "$unix" 2>/dev/null && pwd) || continue
+      # Library 0 is Steam's own folder, reached here through dosdevices/c:.
+      printf '%s\n' "$libs" | grep -qxF "$real" || libs="$libs
+$real"
+    done < <(sed -n 's/^[[:space:]]*"path"[[:space:]]*"\(.*\)"[[:space:]]*$/\1/p' "$root/steamapps/libraryfolders.vdf")
+  fi
+  printf '%s\n' "$libs" | while IFS= read -r lib; do
+    for f in "$lib"/appmanifest_*.acf; do
+      [ -f "$f" ] || continue
+      local id name dir
+      id=$(sed -n 's/^[[:space:]]*"appid"[[:space:]]*"\([0-9]*\)".*/\1/p' "$f" | head -1)
+      name=$(sed -n 's/^[[:space:]]*"name"[[:space:]]*"\(.*\)"[[:space:]]*$/\1/p' "$f" | head -1)
+      dir=$(sed -n 's/^[[:space:]]*"installdir"[[:space:]]*"\(.*\)"[[:space:]]*$/\1/p' "$f" | head -1)
+      # Skip Steam's own runtimes (Steamworks redistributables, Proton, etc.).
+      case "$id" in 228980|1070560|1391110|1628350) continue ;; esac
+      [ -n "$id" ] && printf '%s\t%s\t%s\n' "$id" "$name" "$dir"
+    done
+  done
+}
+
+cmd_steam_games() {
+  bottle_exists "$STEAM_BOTTLE" || die "Steam isn't installed yet; run: burrow steam"
+  local out; out=$(steam_games)
+  [ -n "$out" ] || { say "No Steam games installed yet. Install them in Steam, then run this again."; return 0; }
+  printf '%s\n' "$out" | while IFS="$(printf '\t')" read -r id name dir; do
+    printf '%-10s %s\n' "$id" "$name"
+  done
+}
+
+# Adds every installed Steam game to the library so it shows in the app menu and can get a
+# Mac shortcut.
+cmd_steam_sync() {
+  local out added=0; out=$(steam_games)
+  [ -n "$out" ] || { say "No Steam games installed yet."; return 0; }
+  while IFS="$(printf '\t')" read -r id name dir; do
+    [ -n "$id" ] || continue
+    local lid; lid=$(slugify "$name")
+    [ -f "$(lib_file "$lid")" ] && continue
+    lid=$(lib_add "$name" "$STEAM_BOTTLE" "steam://rungameid/$id")
+    conf_set "$(lib_file "$lid")" steam_appid "$id"
+    ok "Added $name"; added=$((added + 1))
+  done < <(printf '%s\n' "$out")
+  [ "$added" -gt 0 ] || say "Your Steam games are already in the library."
+}
+
+cmd_steam_play() { # appid or name
+  local q="${1:-}" id=""
+  [ -n "$q" ] || die "usage: burrow steam play <appid or game name>"
+  case "$q" in *[!0-9]*) ;; *) id="$q" ;; esac
+  if [ -z "$id" ]; then
+    id=$(steam_games | awk -F '\t' -v q="$(printf '%s' "$q" | tr '[:upper:]' '[:lower:]')" 'tolower($2)==q {print $1; exit}')
+    [ -n "$id" ] || id=$(steam_games | awk -F '\t' -v q="$(printf '%s' "$q" | tr '[:upper:]' '[:lower:]')" 'index(tolower($2),q) {print $1; exit}')
+    [ -n "$id" ] || die "no installed Steam game matches '$q' (see: burrow steam games)"
+  fi
+  cmd_steam_open -applaunch "$id"
+}
+
+cmd_steam() {
+  local sub="${1:-open}"; shift || true
+  case "$sub" in
+    open|start) cmd_steam_open "$@" ;;
+    install) cmd_steam_install ;;
+    games) cmd_steam_games ;;
+    sync) cmd_steam_sync ;;
+    play|launch) cmd_steam_play "$@" ;;
+    fix) cmd_steam_install; wrap_webhelpers ;;
+    *) die "unknown: burrow steam $sub (open, games, play, sync, fix)" ;;
+  esac
+}
+
+# --- Mac shortcuts ------------------------------------------------------------------------------
+# Each shortcut is a tiny AppleScript app made on this Mac with osacompile. Apps made locally
+# carry no quarantine flag, so Gatekeeper doesn't stop them.
+applescript_quote() { printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g'; }
+shell_quote() { printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\\\''/g")"; }
+
+cmd_shortcut() { # app
+  is_mac || die "shortcuts are Mac apps; run this on the Mac"
+  local id f name; id=$(lib_find "${1:-}") || die "no app called '${1:-}' (see: burrow apps)"
+  f=$(lib_file "$id"); name=$(conf_get "$f" name)
+  mkdir -p "$SHORTCUTS"
+  local cmd; cmd="$(shell_quote "$APPDIR/bin/burrow") launch $(shell_quote "$id") >/dev/null 2>&1 &"
+  local app; app="$SHORTCUTS/$(printf '%s' "$name" | tr '/:' '--').app"
+  rm -rf "$app"
+  /usr/bin/osacompile -o "$app" -e "do shell script \"$(applescript_quote "$cmd")\"" || die "couldn't make the shortcut"
+  ok "Made $app (drag it to your Dock)"
+}
+
+cmd_app() { # builds Burrow.app, the menu-style launcher
+  is_mac || die "Burrow.app is made on the Mac"
+  local src="$APPDIR/app/Burrow.applescript" dest="${1:-$HOME/Applications/Burrow.app}"
+  [ -f "$src" ] || die "missing $src"
+  mkdir -p "$(dirname "$dest")"
+  local tmp; tmp=$(mktemp -t burrow) || die "couldn't make a temp file"
+  sed "s|__BURROW_CLI__|$(applescript_quote "$APPDIR/bin/burrow" | sed 's/[|&]/\\&/g')|" "$src" > "$tmp"
+  rm -rf "$dest"
+  /usr/bin/osacompile -l AppleScript -o "$dest" "$tmp" || { rm -f "$tmp"; die "couldn't build Burrow.app"; }
+  rm -f "$tmp"
+  ok "Made $dest"
+}
+
+# --- Housekeeping ----------------------------------------------------------------------------------
+cmd_doctor() {
+  step "Burrow $BURROW_VERSION doctor"
+  if is_mac; then
+    say "macOS $(sw_vers -productVersion) on $(uname -m)"
+    if [ "$(uname -m)" = arm64 ]; then
+      /usr/bin/arch -x86_64 /usr/bin/true 2>/dev/null && ok "Rosetta 2" || warn "Rosetta 2 missing (burrow setup installs it)"
+    fi
+    [ -d /Library/Frameworks/GStreamer.framework ] && ok "GStreamer (in-game video)" || warn "GStreamer missing: game intro videos may be black"
+  fi
+  engine_ok "$STOCK_ENGINE" && ok "Wine $WINE_VERSION" || warn "Wine missing: burrow setup"
+  [ -d "$RUNTIMES/dxmt-$DXMT_VERSION/x86_64-windows" ] && ok "DXMT $DXMT_VERSION downloaded" || warn "DXMT missing: burrow setup"
+  engine_ok "$TURBO_ENGINE" && ok "Turbo graphics built" || warn "Turbo graphics not built: burrow turbo"
+  if bottle_exists "$STEAM_BOTTLE"; then
+    [ -f "$(steam_root)/steam.exe" ] || [ -f "$(steam_root)/Steam.exe" ] && ok "Windows Steam installed" || warn "Steam bottle exists but Steam isn't installed: burrow steam install"
+    local unwrapped; unwrapped=$(find "$(steam_root)/bin/cef" -name steamwebhelper.exe 2>/dev/null | while IFS= read -r f; do grep -aq "$WRAPPER_MARKER" "$f" || echo "$f"; done)
+    [ -z "$unwrapped" ] && ok "Steam window fix in place" || warn "Steam window fix not applied yet (applied on next burrow steam)"
+  fi
+  local free; free=$(df -Pk "$HOME" 2>/dev/null | awk 'NR==2 {print int($4/1048576)}')
+  [ -n "$free" ] && { [ "$free" -ge 20 ] && ok "${free} GB free" || warn "only ${free} GB free; games and Wine need room"; }
+  return 0
+}
+
+# One line of flags for Burrow.app: "setup=1 turbo=0 steam=1".
+cmd_status() {
+  local s=0 t=0 st=0
+  { [ -n "${BURROW_WINE:-}" ] || engine_ok "$STOCK_ENGINE"; } && s=1
+  engine_ok "$TURBO_ENGINE" && t=1
+  { [ -f "$(steam_root)/steam.exe" ] || [ -f "$(steam_root)/Steam.exe" ]; } && st=1
+  printf 'setup=%s turbo=%s steam=%s\n' "$s" "$t" "$st"
+}
+
+cmd_kill() { # [bottle] stops every program in a bottle (or all bottles)
+  local d
+  if [ -n "${1:-}" ]; then use_bottle "$1"; "$WINESERVER" -k 2>/dev/null; ok "Stopped everything in '$1'"; return; fi
+  for d in "$BOTTLES"/*/; do
+    [ -d "$d/prefix" ] || continue
+    ( use_bottle "$(basename "$d")" && "$WINESERVER" -k 2>/dev/null )
+  done
+  ok "Stopped all Windows programs"
+}
+
+cmd_winecfg() { local b="${1:-$STEAM_BOTTLE}"; bottle_exists "$b" || die "no bottle named '$b'"; use_bottle "$b"; "$WINE" winecfg; }
+
+usage() {
+  cat <<EOF
+${B}Burrow $BURROW_VERSION${N}: Windows programs and Windows Steam on your Mac.
+
+  ${B}burrow setup${N}                     download Wine and DXMT (once)
+  ${B}burrow turbo${N}                     build fast Metal graphics for 3D games (once)
+  ${B}burrow steam${N}                     install (first time) and open Windows Steam
+  burrow steam games               list installed Steam games
+  burrow steam play "Schedule I"   start a Steam game
+  burrow steam sync                put your Steam games in the library
+  ${B}burrow install${N} <setup.exe|url>   install a Windows program into its own bottle
+  burrow apps                      list your library
+  burrow launch <app>              start a program (--graphics turbo|compat)
+  burrow shortcut <app>            make a Mac app for it in ~/Applications/Burrow
+  burrow add NAME --bottle B --exe 'C:\\path\\app.exe'
+  burrow remove <app>
+  burrow bottle new|list|delete|engine
+  burrow run <bottle> <program.exe> [args]
+  burrow winecfg [bottle]          Wine's settings window
+  burrow kill [bottle]             force-quit Windows programs
+  burrow doctor                    check everything
+  burrow app                       make Burrow.app (the menu launcher)
+
+Files live in: $BURROW_HOME
+EOF
+}
+
+main() {
+  local cmd="${1:-help}"; shift || true
+  mkdir -p "$ENGINES" "$RUNTIMES" "$BOTTLES" "$LIBRARY" "$LOGS" "$CACHE" 2>/dev/null
+  case "$cmd" in
+    setup) cmd_setup ;;
+    turbo) cmd_turbo "$@" ;;
+    steam) cmd_steam "$@" ;;
+    install) cmd_install "$@" ;;
+    add) cmd_add "$@" ;;
+    apps|library|list) cmd_apps "$@" ;;
+    status) cmd_status ;;
+    launch|open|play) cmd_launch "$@" ;;
+    remove|rm) cmd_remove "$@" ;;
+    shortcut) cmd_shortcut "$@" ;;
+    bottle|bottles) cmd_bottle "$@" ;;
+    run) cmd_run "$@" ;;
+    winecfg|settings) cmd_winecfg "$@" ;;
+    kill|stop) cmd_kill "$@" ;;
+    doctor) cmd_doctor ;;
+    app) cmd_app "$@" ;;
+    version|--version|-v) say "burrow $BURROW_VERSION" ;;
+    help|--help|-h) usage ;;
+    *) usage; die "unknown command: $cmd" ;;
+  esac
+}
+
+main "$@"
