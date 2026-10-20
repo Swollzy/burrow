@@ -7,7 +7,7 @@
 # no mapfile. Run `burrow help` for the commands.
 set -u
 
-BURROW_VERSION="0.1.0"
+BURROW_VERSION="0.2.0"
 
 # --- Paths and pinned downloads -------------------------------------------------------
 BURROW_HOME="${BURROW_HOME:-$HOME/Library/Application Support/Burrow}"
@@ -386,6 +386,10 @@ cmd_turbo() {
   overlay_dxmt "$out.new"
   rm -rf "$out"; mv "$out.new" "$out"
   ok "Turbo graphics built. Bottles on 'auto' use it from now on."
+  # The Command Line Tools are installed now; swap the simple menu for the window app.
+  if [ -d "$HOME/Applications/Burrow.app" ] && [ ! -f "$HOME/Applications/Burrow.app/Contents/MacOS/Burrow" ]; then
+    build_window_app "$HOME/Applications/Burrow.app" && ok "Upgraded Burrow.app to the window app"
+  fi
 }
 
 overlay_dxmt() { # engine-root
@@ -427,9 +431,10 @@ lib_find() {
 cmd_apps() {
   local f any=0
   if [ "${1:-}" = "--plain" ]; then
-    # For Burrow.app: "id<TAB>name" per line.
+    # For Burrow.app: "id<TAB>name<TAB>bottle<TAB>steam-appid" per line.
     for f in "$LIBRARY"/*.app.conf; do
-      [ -f "$f" ] && printf '%s\t%s\n' "$(basename "$f" .app.conf)" "$(conf_get "$f" name)"
+      [ -f "$f" ] && printf '%s\t%s\t%s\t%s\n' "$(basename "$f" .app.conf)" "$(conf_get "$f" name)" \
+        "$(conf_get "$f" bottle)" "$(conf_get "$f" steam_appid 2>/dev/null)"
     done
     return 0
   fi
@@ -676,6 +681,10 @@ $real"
 }
 
 cmd_steam_games() {
+  if [ "${1:-}" = "--plain" ]; then
+    bottle_exists "$STEAM_BOTTLE" && steam_games | cut -f1,2
+    return 0
+  fi
   bottle_exists "$STEAM_BOTTLE" || die "Steam isn't installed yet; run: burrow steam"
   local out; out=$(steam_games)
   [ -n "$out" ] || { say "No Steam games installed yet. Install them in Steam, then run this again."; return 0; }
@@ -717,7 +726,7 @@ cmd_steam() {
   case "$sub" in
     open|start) cmd_steam_open "$@" ;;
     install) cmd_steam_install ;;
-    games) cmd_steam_games ;;
+    games) cmd_steam_games "$@" ;;
     sync) cmd_steam_sync ;;
     play|launch) cmd_steam_play "$@" ;;
     fix) cmd_steam_install; wrap_webhelpers ;;
@@ -743,17 +752,77 @@ cmd_shortcut() { # app
   ok "Made $app (drag it to your Dock)"
 }
 
-cmd_app() { # builds Burrow.app, the menu-style launcher
+cmd_app() { # builds Burrow.app: the windowed app, or the simple menu if Swift isn't available
   is_mac || die "Burrow.app is made on the Mac"
-  local src="$APPDIR/app/Burrow.applescript" dest="${1:-$HOME/Applications/Burrow.app}"
-  [ -f "$src" ] || die "missing $src"
+  local dest="${1:-$HOME/Applications/Burrow.app}"
   mkdir -p "$(dirname "$dest")"
+  if [ "${BURROW_MENU_APP:-0}" != 1 ] && build_window_app "$dest"; then
+    ok "Made $dest"
+    return 0
+  fi
+  build_menu_app "$dest"
+}
+
+# The windowed app (app/BurrowApp.swift), compiled with the Command Line Tools' swiftc.
+build_window_app() { # dest
+  local dest="$1" src="$APPDIR/app/BurrowApp.swift" swiftc
+  [ -f "$src" ] || return 1
+  if ! xcode-select -p >/dev/null 2>&1 || ! swiftc=$(xcrun --find swiftc 2>/dev/null); then
+    warn "Apple's Command Line Tools aren't installed, so Burrow gets its simple menu for now."
+    warn "Install them (xcode-select --install), then run: burrow app"
+    return 1
+  fi
+  local major; major=$(sw_vers -productVersion | cut -d. -f1)
+  if [ "$major" -lt 13 ]; then warn "the Burrow window needs macOS 13 or newer; using the simple menu"; return 1; fi
+  step "Building the Burrow window app…"
+  local tmp; tmp=$(mktemp -d -t burrow-app) || return 1
+  local log="$LOGS/app-build.log"
+  if ! "$swiftc" -O -swift-version 5 -parse-as-library -target "$(uname -m)-apple-macos13.0" \
+        "$src" -o "$tmp/Burrow" > "$log" 2>&1; then
+    warn "The window app didn't compile (details in $log); using the simple menu. Send that file to Claude."
+    rm -rf "$tmp"
+    return 1
+  fi
+  local app="$tmp/Burrow.app"
+  mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources"
+  mv "$tmp/Burrow" "$app/Contents/MacOS/Burrow"
+  cat > "$app/Contents/Info.plist" <<PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>CFBundleName</key><string>Burrow</string>
+  <key>CFBundleDisplayName</key><string>Burrow</string>
+  <key>CFBundleIdentifier</key><string>com.swollzy.burrow</string>
+  <key>CFBundleExecutable</key><string>Burrow</string>
+  <key>CFBundlePackageType</key><string>APPL</string>
+  <key>CFBundleShortVersionString</key><string>$BURROW_VERSION</string>
+  <key>CFBundleVersion</key><string>$BURROW_VERSION</string>
+  <key>LSMinimumSystemVersion</key><string>13.0</string>
+  <key>LSApplicationCategoryType</key><string>public.app-category.games</string>
+  <key>NSHighResolutionCapable</key><true/>
+  <key>NSAppleEventsUsageDescription</key><string>Burrow opens Terminal to install Homebrew.</string>
+</dict>
+</plist>
+PLIST
+  # Ad-hoc signature so Apple Silicon runs it; made on this Mac, so no quarantine.
+  codesign --force --deep -s - "$app" >/dev/null 2>&1 || true
+  rm -rf "$dest"
+  mv "$app" "$dest"
+  rm -rf "$tmp"
+  return 0
+}
+
+# The simple menu (app/Burrow.applescript), made with osacompile; works without developer tools.
+build_menu_app() { # dest
+  local src="$APPDIR/app/Burrow.applescript" dest="$1"
+  [ -f "$src" ] || die "missing $src"
   local tmp; tmp=$(mktemp -t burrow) || die "couldn't make a temp file"
   sed "s|__BURROW_CLI__|$(applescript_quote "$APPDIR/bin/burrow" | sed 's/[|&]/\\&/g')|" "$src" > "$tmp"
   rm -rf "$dest"
   /usr/bin/osacompile -l AppleScript -o "$dest" "$tmp" || { rm -f "$tmp"; die "couldn't build Burrow.app"; }
   rm -f "$tmp"
-  ok "Made $dest"
+  ok "Made $dest (simple menu)"
 }
 
 # --- Housekeeping ----------------------------------------------------------------------------------
@@ -779,13 +848,120 @@ cmd_doctor() {
   return 0
 }
 
-# One line of flags for Burrow.app: "setup=1 turbo=0 steam=1".
+# --- Usage: disk space and memory ------------------------------------------------------------
+kb_size() { du -sk "$1" 2>/dev/null | awk '{print $1+0}'; }
+human_kb() { awk -v k="${1:-0}" 'BEGIN { if (k >= 1048576) printf "%.1f GB", k/1048576; else if (k >= 1024) printf "%.0f MB", k/1024; else printf "%d KB", k }'; }
+
+# The environment of a running process, one VAR=value per line (best effort).
+proc_env() { # pid
+  if [ -r "/proc/$1/environ" ]; then { tr '\000' '\n' < "/proc/$1/environ"; } 2>/dev/null
+  else ps -E -ww -p "$1" -o command= 2>/dev/null; fi
+}
+
+# Prints "bottle<TAB>name<TAB>pid<TAB>rss-kb" for every running process started in a bottle.
+running_procs() {
+  local bottles=() d
+  for d in "$BOTTLES"/*/; do [ -d "$d/prefix" ] && bottles+=("$(basename "$d")"); done
+  [ ${#bottles[@]} -gt 0 ] || return 0
+  ps -axww -o pid= -o rss= -o command= 2>/dev/null | while read -r pid rss cmd; do
+    [ "$pid" = "$$" ] && continue
+    case "$cmd" in *wine*|*.exe*|*.EXE*) ;; *) continue ;; esac
+    local env b found="" name
+    env=$(proc_env "$pid") || continue
+    for b in "${bottles[@]}"; do
+      case "$env" in *"WINEPREFIX=$BOTTLES/$b/prefix"*) found="$b"; break ;; esac
+    done
+    [ -n "$found" ] || continue
+    name=$(printf '%s' "$cmd" | grep -oiE '[^\\/]+\.exe' | head -1)
+    [ -n "$name" ] || name=$(basename "${cmd%% *}")
+    case "$name" in wineserver*) name="Wine (system)" ;; esac
+    printf '%s\t%s\t%s\t%s\n' "$found" "$name" "$pid" "${rss:-0}"
+  done
+}
+
+cmd_usage() { # [--plain] [--ram]
+  local plain=0 ramonly=0 a
+  for a in "$@"; do case "$a" in --plain) plain=1 ;; --ram) ramonly=1 ;; esac; done
+  local procs; procs=$(running_procs)
+  if [ "$ramonly" = 0 ]; then
+    local rows="" d n k total=0
+    for d in "$BOTTLES"/*/; do
+      [ -d "$d" ] || continue
+      n=$(basename "$d"); k=$(kb_size "$d"); total=$((total + k))
+      rows="$rows$(printf 'bottle\t%s\t%s' "$n" "$k")
+"
+    done
+    # Steam games, inside the Steam bottle (already counted in its total).
+    local games=""
+    if bottle_exists "$STEAM_BOTTLE"; then
+      local id name dir common
+      common="$(steam_root)/steamapps/common"
+      while IFS="$(printf '\t')" read -r id name dir; do
+        [ -n "$id" ] && [ -d "$common/$dir" ] || continue
+        games="$games$(printf 'game\t%s\t%s' "$name" "$(kb_size "$common/$dir")")
+"
+      done < <(steam_games)
+    fi
+    k=$(kb_size "$ENGINES"); total=$((total + k)); rows="$rows$(printf 'engine\tWine engines\t%s' "$k")
+"
+    k=$(( $(kb_size "$RUNTIMES") + $(kb_size "$CACHE") + $(kb_size "$LOGS") )); total=$((total + k))
+    rows="$rows$(printf 'other\tDownloads, cache and logs\t%s' "$k")
+"
+    local free; free=$(df -Pk "$BURROW_HOME" 2>/dev/null | awk 'NR==2 {print $4+0}')
+    if [ "$plain" = 1 ]; then
+      printf '%s%s' "$rows" "$games" | sed '/^$/d' | sed 's/^/DISK\t/'
+      printf 'TOTAL\t%s\nFREE\t%s\n' "$total" "${free:-0}"
+    else
+      say "${B}Disk space used by Burrow${N}  ($BURROW_HOME)"
+      printf '%s' "$rows" | while IFS="$(printf '\t')" read -r kind n k; do
+        [ -n "$kind" ] || continue
+        case "$kind" in bottle) n="Bottle: $n" ;; esac
+        printf '  %-40s %10s\n' "$n" "$(human_kb "$k")"
+      done
+      if [ -n "$games" ]; then
+        say "  ${D}Steam games (inside the Steam bottle):${N}"
+        printf '%s' "$games" | while IFS="$(printf '\t')" read -r kind n k; do
+          [ -n "$kind" ] && printf '    %-38s %10s\n' "$n" "$(human_kb "$k")"
+        done
+      fi
+      printf '  %-40s %10s\n' "${B}Total${N}" "$(human_kb "$total")"
+      printf '  %-40s %10s\n' "Free on this disk" "$(human_kb "${free:-0}")"
+      say ""
+    fi
+  fi
+  if [ "$plain" = 1 ]; then
+    printf '%s\n' "$procs" | sed '/^$/d' | sed 's/^/PROC\t/'
+    return 0
+  fi
+  say "${B}Memory (RAM) used by running Windows programs${N}"
+  if [ -z "$procs" ]; then say "  Nothing is running."; return 0; fi
+  printf '%s\n' "$procs" | sort -t "$(printf '\t')" -k4,4nr | while IFS="$(printf '\t')" read -r b n pid k; do
+    printf '  %-28s %-12s %10s\n' "$n" "($b)" "$(human_kb "$k")"
+  done
+  local sum; sum=$(printf '%s\n' "$procs" | awk -F '\t' '{s += $4} END {print s+0}')
+  printf '  %-41s %10s\n' "${B}Total${N}" "$(human_kb "$sum")"
+}
+
+# Asks macOS to install Apple's Command Line Tools (needed for turbo and the window app).
+cmd_tools() {
+  is_mac || die "this is for the Mac"
+  if xcode-select -p >/dev/null 2>&1; then ok "Apple's Command Line Tools are installed"; return 0; fi
+  xcode-select --install 2>/dev/null || true
+  say "Click Install in the window that opened. When it finishes, come back and continue."
+}
+
+# One line of flags for Burrow.app: "setup=1 turbo=0 steam=1 clt=1 brew=0 gst=0 mac=1 arm=1".
 cmd_status() {
-  local s=0 t=0 st=0
-  { [ -n "${BURROW_WINE:-}" ] || engine_ok "$STOCK_ENGINE"; } && s=1
+  local s=0 t=0 st=0 clt=0 brew=0 gst=0 mac=0 arm=0
+  { [ -n "${BURROW_WINE:-}" ] || engine_ok "$STOCK_ENGINE"; } && [ -d "$RUNTIMES/dxmt-$DXMT_VERSION/x86_64-windows" ] && s=1
   engine_ok "$TURBO_ENGINE" && t=1
   { [ -f "$(steam_root)/steam.exe" ] || [ -f "$(steam_root)/Steam.exe" ]; } && st=1
-  printf 'setup=%s turbo=%s steam=%s\n' "$s" "$t" "$st"
+  is_mac && mac=1
+  [ "$(uname -m)" = arm64 ] && arm=1
+  is_mac && xcode-select -p >/dev/null 2>&1 && clt=1
+  { [ -x /opt/homebrew/bin/brew ] || [ -x /usr/local/bin/brew ]; } && brew=1
+  [ -d /Library/Frameworks/GStreamer.framework ] && gst=1
+  printf 'setup=%s turbo=%s steam=%s clt=%s brew=%s gst=%s mac=%s arm=%s\n' "$s" "$t" "$st" "$clt" "$brew" "$gst" "$mac" "$arm"
 }
 
 cmd_kill() { # [bottle] stops every program in a bottle (or all bottles)
@@ -820,8 +996,10 @@ ${B}Burrow $BURROW_VERSION${N}: Windows programs and Windows Steam on your Mac.
   burrow run <bottle> <program.exe> [args]
   burrow winecfg [bottle]          Wine's settings window
   burrow kill [bottle]             force-quit Windows programs
+  burrow usage                     disk space per bottle and game, and RAM of running programs
+  burrow usage --ram               just the memory of running programs
   burrow doctor                    check everything
-  burrow app                       make Burrow.app (the menu launcher)
+  burrow app                       (re)build Burrow.app, the window app
 
 Files live in: $BURROW_HOME
 EOF
@@ -838,6 +1016,8 @@ main() {
     add) cmd_add "$@" ;;
     apps|library|list) cmd_apps "$@" ;;
     status) cmd_status ;;
+    usage|du|memory|top) cmd_usage "$@" ;;
+    tools) cmd_tools ;;
     launch|open|play) cmd_launch "$@" ;;
     remove|rm) cmd_remove "$@" ;;
     shortcut) cmd_shortcut "$@" ;;

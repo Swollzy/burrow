@@ -18,17 +18,31 @@ downloads from their own sites during setup:
 
 1. Unzip `Burrow.zip` in Downloads.
 2. Open **Terminal**, type `bash ` (with a space), drag `install.sh` from the Burrow
-   folder into the window, and press Return.
-3. It downloads Wine and DXMT, asks to build **turbo graphics** (say yes; it takes a few
-   minutes and installs Apple's free Command Line Tools and three Homebrew packages the
-   first time), then installs and opens Windows Steam.
-4. Sign in to Steam and install your games as usual.
-5. Next time, open **Burrow** from `~/Applications` (drag it to your Dock). Pick
-   "Add my Steam games to this list" once, then pick a game to play it, or make a Dock
-   shortcut for it.
+   folder into the window, and press Return. This is the only Terminal step.
+3. If Apple's free Command Line Tools aren't installed, a macOS window asks to install
+   them; click Install and the script waits. They're needed to build the Burrow window
+   (and turbo graphics).
+4. The **Burrow** window opens (it lives in `~/Applications`; drag it to your Dock). Work
+   down the **Setup** tab: download Wine, install Homebrew (opens in Terminal because it
+   asks for your password), build turbo graphics, install Windows Steam.
+5. Sign in to Steam and install your games. On the **Steam** tab press "Add Games to
+   Library", then play them from **Library**.
 
-Burrow needs macOS 11 or newer; turbo graphics needs an Apple Silicon Mac and DXMT works best
-on macOS 15 Sequoia or newer. Leave about 20 GB free for Wine and the bottles, plus your games.
+The window has four tabs:
+
+- **Library**: your programs and Steam games as cards with a Play button. The `…` menu
+  makes a Dock shortcut, plays with compatible (slower, older) graphics, or removes it.
+  "Install Windows Program…" picks an installer and shows its progress.
+- **Steam**: install or open Windows Steam, list installed games, play one.
+- **Usage**: disk space for each bottle, each Steam game, Wine and downloads, plus free
+  space on your Mac (orange under 20 GB); and live memory (RAM) for every running Windows
+  program, grouped by bottle, with Quit buttons.
+- **Setup**: each step with a check mark, plus "Check Everything" and the logs folder.
+
+Burrow needs macOS 11 or newer (the window needs macOS 13); turbo graphics needs an Apple
+Silicon Mac and DXMT works best on macOS 15 Sequoia or newer. Leave about 20 GB free for Wine
+and the bottles, plus your games. If the window can't be built, Burrow falls back to a
+simple pick-from-a-list menu and saves the reason in `logs/app-build.log`.
 
 ## Commands
 
@@ -43,10 +57,13 @@ burrow install <setup.exe|url> install any Windows program into its own bottle
 burrow apps                    list your library
 burrow launch <app>            start a program (--graphics turbo|compat to override)
 burrow shortcut <app>          make a Mac app for it in ~/Applications/Burrow
+burrow usage                   disk space per bottle and game, RAM of running programs
+burrow usage --ram             just the memory of running programs
 burrow doctor                  check everything
 burrow kill                    force-quit Windows programs
 ```
 
+The Burrow window runs these same commands, so Terminal and the window always agree.
 Everything lives in `~/Library/Application Support/Burrow` (engines, bottles, library,
 logs). Each launch writes a log to `logs/` there, which is what to send when a game fails.
 

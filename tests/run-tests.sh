@@ -108,8 +108,17 @@ check "steam sync adds games to the library" '"$burrow" apps | grep -q "Schedule
 "$burrow" launch "Data Center" >/dev/null 2>&1
 check "library launch of a Steam game goes through Steam" 'tr -d "\000" < "$st/steam.txt" | grep -q -- "-applaunch 1111111"'
 
-check "apps --plain is id<TAB>name" '"$burrow" apps --plain | grep -q "^schedule-i	Schedule I$"'
-check "status line" '"$burrow" status | grep -q "setup=1 turbo=0 steam=1"'
+check "apps --plain is id<TAB>name<TAB>bottle<TAB>appid" '"$burrow" apps --plain | grep -q "^schedule-i	Schedule I	Steam	3164500$"'
+check "steam games --plain" '"$burrow" steam games --plain | grep -q "^1111111	Data Center$"'
+mkdir -p "$BURROW_HOME/runtimes/dxmt-v0.80/x86_64-windows" "$sroot/steamapps/common/Schedule I"
+head -c 2000000 /dev/zero > "$sroot/steamapps/common/Schedule I/game.bin"   # stands in for the DXMT download
+check "status line" '"$burrow" status | grep -q "^setup=1 turbo=0 steam=1 clt=0 "'
+check "usage lists bottles, games and free space" 'out=$("$burrow" usage --plain); printf "%s" "$out" | grep -q "^DISK	bottle	Steam	" && printf "%s" "$out" | grep -q "^DISK	game	Schedule I	" && printf "%s" "$out" | grep -q "^FREE	[0-9]"'
+"$burrow" run Games notepad >/dev/null 2>&1 &
+for _ in 1 2 3 4 5 6 7 8 9 10; do "$burrow" usage --ram --plain | grep -qi "notepad.exe" && break; sleep 1; done
+check "usage --ram finds a running program in its bottle" '"$burrow" usage --ram --plain | grep -qi "^PROC	Games	notepad.exe	[0-9]*	[0-9]"'
+check "usage human output" '"$burrow" usage | grep -q "Memory (RAM)"'
+"$burrow" kill Games >/dev/null 2>&1
 "$burrow" remove Direct >/dev/null
 check "remove" '! "$burrow" apps | grep -q Direct'
 "$burrow" bottle delete Games --yes >/dev/null

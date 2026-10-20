@@ -1,7 +1,8 @@
 #!/bin/bash
-# Installs Burrow for this Mac user. Run it from Terminal:
+# Installs Burrow for this Mac user and opens the Burrow window. Run it from Terminal:
 #     bash ~/Downloads/Burrow/install.sh
 # (Typing "bash " and dragging this file into Terminal works too.)
+# Everything after this (Wine, turbo graphics, Steam) is done from the Burrow window.
 set -eu
 
 src="$(cd "$(dirname "$0")" && pwd)"
@@ -21,7 +22,7 @@ rm -rf "$dest"
 mv "$dest.new" "$dest"
 xattr -dr com.apple.quarantine "$dest" 2>/dev/null || true
 
-# Let "burrow" work in new Terminal windows.
+# Let "burrow" work in new Terminal windows too.
 mkdir -p "$HOME/.local/bin"
 ln -sf "$dest/bin/burrow" "$HOME/.local/bin/burrow"
 marker="# added by Burrow"
@@ -31,18 +32,27 @@ for rc in "$HOME/.zprofile" "$HOME/.bash_profile"; do
   fi
 done
 
+# The Burrow window is built on this Mac with Apple's free Command Line Tools (turbo
+# graphics needs them too). Without them Burrow falls back to a simple menu.
+if ! xcode-select -p >/dev/null 2>&1; then
+  echo
+  echo "Burrow needs Apple's free Command Line Tools. Click Install in the window that opens."
+  xcode-select --install 2>/dev/null || true
+  echo "Waiting for the install to finish (this window carries on by itself)…"
+  waited=0
+  until xcode-select -p >/dev/null 2>&1; do
+    sleep 10
+    waited=$((waited + 10))
+    if [ "$waited" -ge 3600 ]; then
+      echo "Still not installed; continuing with the simple menu. Run 'burrow app' later for the window."
+      break
+    fi
+  done
+fi
+
 "$dest/bin/burrow" app "$HOME/Applications/Burrow.app"
-"$dest/bin/burrow" setup
 
 echo
-printf 'Build turbo graphics now? Most 3D games need it. It takes a few minutes. [Y/n] '
-read -r answer || answer=y
-case "$answer" in [nN]*) ;; *) "$dest/bin/burrow" turbo ;; esac
-
-echo
-printf 'Install and open Windows Steam now? [Y/n] '
-read -r answer || answer=y
-case "$answer" in [nN]*) ;; *) "$dest/bin/burrow" steam ;; esac
-
-echo
-echo "Done. Open Burrow from ~/Applications/Burrow.app (drag it to your Dock), or type: burrow help"
+echo "Done. Burrow is in your Applications folder (~/Applications/Burrow.app); drag it to your Dock."
+echo "Opening it now. Start on the Setup tab."
+open "$HOME/Applications/Burrow.app"
