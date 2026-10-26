@@ -1,0 +1,52 @@
+name: Turbo build
+
+# Builds turbo graphics end to end on an Apple Silicon runner: downloads Wine and DXMT,
+# compiles the patched Wine pieces and assembles the turbo engine. Slow (it compiles part of
+# Wine), so it runs when the turbo code or patches change, or by hand.
+on:
+  push:
+    branches: ['claude/turbo**']
+  pull_request:
+    paths: ['engine/**', '.github/workflows/turbo.yml']
+  workflow_dispatch:
+
+jobs:
+  turbo:
+    name: burrow setup + turbo (macOS arm64)
+    runs-on: macos-14
+    timeout-minutes: 60
+    env:
+      BURROW_HOME: ${{ github.workspace }}/../burrow-home
+      HOMEBREW_NO_AUTO_UPDATE: '1'
+    steps:
+      - uses: actions/checkout@v4
+      - name: Machine
+        run: |
+          sw_vers; uname -m; xcode-select -p; clang --version | head -1
+          /usr/bin/arch -x86_64 /usr/bin/true && echo "Rosetta: yes" || echo "Rosetta: no"
+      - name: burrow setup
+        run: bin/burrow setup
+      - name: burrow turbo
+        run: bin/burrow turbo
+      - name: Check the turbo engine
+        run: |
+          bin/burrow status
+          bin/burrow doctor
+          bin/burrow status | grep -q 'turbo=1'
+      - name: Show the end of the build logs
+        if: failure()
+        run: |
+          for f in "$BURROW_HOME"/cache/turbo/build-*/configure.log "$BURROW_HOME"/cache/turbo/build-*/make.log; do
+            [ -f "$f" ] || continue
+            echo "::group::$f (last 120 lines)"; tail -120 "$f"; echo "::endgroup::"
+          done
+      - name: Keep the build logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: turbo-logs
+          path: |
+            ${{ github.workspace }}/../burrow-home/cache/turbo/build-*/configure.log
+            ${{ github.workspace }}/../burrow-home/cache/turbo/build-*/make.log
+            ${{ github.workspace }}/../burrow-home/cache/turbo/build-*/config.log
+          if-no-files-found: ignore
