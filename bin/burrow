@@ -7,7 +7,7 @@
 # no mapfile. Run `burrow help` for the commands.
 set -u
 
-BURROW_VERSION="0.3.0"
+BURROW_VERSION="0.3.1"
 
 # --- Paths and pinned downloads -------------------------------------------------------
 BURROW_HOME="${BURROW_HOME:-$HOME/Library/Application Support/Burrow}"
@@ -832,8 +832,14 @@ cmd_turbo() {
   [ -n "$version" ] || die "couldn't read the Wine version"
   local major=${version%%.*} series
   case "$version" in *.0) series="$major.0" ;; *) series="$major.x" ;; esac
-  work="$CACHE/turbo"; src="$work/wine-$version"; build="$work/build-$version"; patches="$APPDIR/engine/wine-patches"
+  work=$(turbo_workdir) || exit 1
+  src="$work/wine-$version"; build="$work/build-$version"; patches="$APPDIR/engine/wine-patches"
   mkdir -p "$work"
+  # Builds before 0.3.1 used $CACHE/turbo, which has a space in it on every Mac and never built.
+  if [ "$work" != "$CACHE/turbo" ] && [ -d "$CACHE/turbo" ]; then
+    [ -f "$CACHE/turbo/wine-$version.tar.xz" ] && [ ! -f "$work/wine-$version.tar.xz" ] && mv "$CACHE/turbo/wine-$version.tar.xz" "$work/"
+    rm -rf "${CACHE:?}/turbo"
+  fi
   local applied="$src/.burrow-patches"
   if [ -d "$src" ] && [ ! -f "$applied" ]; then rm -rf "$src"; fi
   if [ ! -d "$src" ]; then
@@ -886,6 +892,15 @@ cmd_turbo() {
   if [ -d "$HOME/Applications/Burrow.app" ] && [ ! -f "$HOME/Applications/Burrow.app/Contents/MacOS/Burrow" ]; then
     build_window_app "$HOME/Applications/Burrow.app" && ok "Upgraded Burrow.app to the window app"
   fi
+}
+
+# Where the Wine source is unpacked and compiled. Wine's build can't cope with spaces in its
+# paths, and Burrow's home ("Application Support") always has one on a Mac.
+turbo_workdir() {
+  local w="${BURROW_TURBO_WORK:-$CACHE/turbo}"
+  case "$w" in *" "*) w="$HOME/Library/Caches/Burrow/turbo" ;; esac
+  case "$w" in *" "*) die "Wine can't be built in a folder with a space in its path ($w); set BURROW_TURBO_WORK to one without" ;; esac
+  printf '%s' "$w"
 }
 
 overlay_dxmt() { # engine-root
@@ -1432,7 +1447,9 @@ cmd_usage() { # [--plain] [--ram]
       k=$(kb_size "$SNAPSHOTS"); total=$((total + k)); rows="$rows$(printf 'snapshot\tSnapshots\t%s' "$k")
 "
     fi
-    k=$(( $(kb_size "$RUNTIMES") + $(kb_size "$CACHE") + $(kb_size "$LOGS") )); total=$((total + k))
+    k=$(( $(kb_size "$RUNTIMES") + $(kb_size "$CACHE") + $(kb_size "$LOGS") ))
+    local tw; tw=$(turbo_workdir 2>/dev/null) && case "$tw" in "$CACHE"/*) ;; *) k=$((k + $(kb_size "$tw"))) ;; esac
+    total=$((total + k))
     rows="$rows$(printf 'other\tDownloads, cache and logs\t%s' "$k")
 "
     local free; free=$(df -Pk "$BURROW_HOME" 2>/dev/null | awk 'NR==2 {print $4+0}')

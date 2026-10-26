@@ -15,8 +15,9 @@ jobs:
     name: burrow setup + turbo (macOS arm64)
     runs-on: macos-14
     timeout-minutes: 60
+    # Burrow's real default home, "~/Library/Application Support/Burrow": its space is exactly
+    # what broke the first turbo builds on a Mac.
     env:
-      BURROW_HOME: ${{ github.workspace }}/../burrow-home
       HOMEBREW_NO_AUTO_UPDATE: '1'
     steps:
       - uses: actions/checkout@v4
@@ -36,7 +37,7 @@ jobs:
       - name: Show the end of the build logs
         if: failure()
         run: |
-          for f in "$BURROW_HOME"/cache/turbo/build-*/configure.log "$BURROW_HOME"/cache/turbo/build-*/make.log; do
+          for f in ~/Library/Caches/Burrow/turbo/build-*/configure.log ~/Library/Caches/Burrow/turbo/build-*/make.log; do
             [ -f "$f" ] || continue
             echo "::group::$f (last 120 lines)"; tail -120 "$f"; echo "::endgroup::"
           done
@@ -46,7 +47,7 @@ jobs:
         with:
           name: turbo-logs
           path: |
-            ${{ github.workspace }}/../burrow-home/cache/turbo/build-*/configure.log
-            ${{ github.workspace }}/../burrow-home/cache/turbo/build-*/make.log
-            ${{ github.workspace }}/../burrow-home/cache/turbo/build-*/config.log
+            ~/Library/Caches/Burrow/turbo/build-*/configure.log
+            ~/Library/Caches/Burrow/turbo/build-*/make.log
+            ~/Library/Caches/Burrow/turbo/build-*/config.log
           if-no-files-found: ignore
