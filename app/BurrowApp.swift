@@ -158,7 +158,7 @@ final class BurrowModel: ObservableObject {
                 self.jobRunning = false
                 self.lastJobFailed = proc.terminationStatus != 0
                 self.consoleText += self.lastJobFailed
-                    ? "\n✗ Stopped with an error. Use Copy to send this to Claude."
+                    ? "\n✗ Stopped with an error. Use Copy to include this when reporting a problem."
                     : "\n✓ Done."
                 self.refreshAll()
                 if !self.lastJobFailed { then?() }
@@ -324,6 +324,7 @@ struct BurrowApp: App {
 struct ContentView: View {
     @EnvironmentObject var model: BurrowModel
     @State private var tab = 0
+    @State private var choseStartTab = false
 
     var body: some View {
         TabView(selection: $tab) {
@@ -338,8 +339,11 @@ struct ContentView: View {
         }
         .padding()
         .sheet(isPresented: $model.showConsole) { ConsoleView().environmentObject(model) }
-        .onAppear {
-            if model.status.loaded && !model.status.has("setup") { tab = 3 }
+        // The status arrives a moment after launch; open on Setup until Wine is installed.
+        .onReceive(model.$status) { status in
+            guard status.loaded, !choseStartTab else { return }
+            choseStartTab = true
+            if !status.has("setup") { tab = 3 }
         }
     }
 }
@@ -615,7 +619,7 @@ struct SetupView: View {
                     Button("Download") { model.runJob("Downloading Wine and DXMT", ["setup"]) }
                 }
                 StepRow(done: model.status.has("clt"), title: "Apple Command Line Tools",
-                        detail: "Free from Apple. Needed to build turbo graphics.") {
+                        detail: "Free from Apple. Needed to build turbo graphics and this window.") {
                     Button("Install") { model.runJob("Apple Command Line Tools", ["tools"]) }
                 }
                 StepRow(done: model.status.has("brew"), title: "Homebrew",
@@ -627,7 +631,7 @@ struct SetupView: View {
                             ? "Builds fast Metal graphics that most 3D games need. One time, a few minutes."
                             : "Needs an Apple Silicon Mac.") {
                     Button("Build") { model.runJob("Building turbo graphics", ["turbo"]) }
-                        .disabled(!model.status.has("setup") || !model.status.has("brew"))
+                        .disabled(!model.status.has("setup") || !model.status.has("clt") || !model.status.has("brew"))
                 }
                 StepRow(done: model.status.has("steam"), title: "Windows Steam",
                         detail: "Installs Steam from Valve into its own bottle.") {

@@ -7,7 +7,7 @@
 # no mapfile. Run `burrow help` for the commands.
 set -u
 
-BURROW_VERSION="0.2.0"
+BURROW_VERSION="0.2.1"
 
 # --- Paths and pinned downloads -------------------------------------------------------
 BURROW_HOME="${BURROW_HOME:-$HOME/Library/Application Support/Burrow}"
@@ -205,7 +205,7 @@ cmd_bottle() {
       fi
       ( use_bottle "$name" && "$WINESERVER" -k ) >/dev/null 2>&1
       rm -rf "$(bottle_dir "$name")"
-      grep -l "^bottle=$name\$" "$LIBRARY"/*.app.conf 2>/dev/null | while IFS= read -r f; do rm -f "$f"; done
+      grep -lxF "bottle=$name" "$LIBRARY"/*.app.conf 2>/dev/null | while IFS= read -r f; do rm -f "$f"; done
       ok "Deleted bottle '$name'" ;;
     engine)
       local name="${1:-}" e="${2:-}"; bottle_exists "$name" || die "no bottle named '$name'"
@@ -404,10 +404,16 @@ overlay_dxmt() { # engine-root
 lib_file() { printf '%s/%s.app.conf' "$LIBRARY" "$1"; }
 
 # Adds a program to the library. target is a Windows path (C:\...), a .lnk or .exe in the bottle.
+# The same name in the same bottle replaces the old entry (a reinstall); the same name in
+# another bottle gets its own id ("name-2") so neither hides the other.
 lib_add() { # name bottle target [args]
-  local name="$1" bottle="$2" target="$3" args="${4:-}" id f
+  local name="$1" bottle="$2" target="$3" args="${4:-}" id f n=2
   id=$(slugify "$name"); [ -n "$id" ] || id="app"
   f=$(lib_file "$id")
+  if [ -f "$f" ] && [ "$(conf_get "$f" bottle)" != "$bottle" ]; then
+    while [ -f "$(lib_file "$id-$n")" ] && [ "$(conf_get "$(lib_file "$id-$n")" bottle)" != "$bottle" ]; do n=$((n + 1)); done
+    id="$id-$n"; f=$(lib_file "$id")
+  fi
   mkdir -p "$LIBRARY"
   { printf 'name=%s\n' "$name"; printf 'bottle=%s\n' "$bottle"; printf 'target=%s\n' "$target"
     printf 'args=%s\n' "$args"; printf 'graphics=auto\n'; } > "$f"
@@ -700,9 +706,8 @@ cmd_steam_sync() {
   [ -n "$out" ] || { say "No Steam games installed yet."; return 0; }
   while IFS="$(printf '\t')" read -r id name dir; do
     [ -n "$id" ] || continue
-    local lid; lid=$(slugify "$name")
-    [ -f "$(lib_file "$lid")" ] && continue
-    lid=$(lib_add "$name" "$STEAM_BOTTLE" "steam://rungameid/$id")
+    grep -qxF "steam_appid=$id" "$LIBRARY"/*.app.conf 2>/dev/null && continue
+    local lid; lid=$(lib_add "$name" "$STEAM_BOTTLE" "steam://rungameid/$id")
     conf_set "$(lib_file "$lid")" steam_appid "$id"
     ok "Added $name"; added=$((added + 1))
   done < <(printf '%s\n' "$out")
@@ -779,7 +784,7 @@ build_window_app() { # dest
   local log="$LOGS/app-build.log"
   if ! "$swiftc" -O -swift-version 5 -parse-as-library -target "$(uname -m)-apple-macos13.0" \
         "$src" -o "$tmp/Burrow" > "$log" 2>&1; then
-    warn "The window app didn't compile (details in $log); using the simple menu. Send that file to Claude."
+    warn "The window app didn't compile (details in $log); using the simple menu."
     rm -rf "$tmp"
     return 1
   fi

@@ -91,6 +91,7 @@ check "steam games lists both libraries" '[ "$("$burrow" steam games | wc -l)" -
 check "steam games skips redistributables" '! "$burrow" steam games | grep -q 228980'
 
 "$burrow" steam >/dev/null 2>&1
+# shellcheck disable=SC2034  # used inside check's eval strings
 st="$BURROW_HOME/bottles/Steam/prefix/drive_c/burrow-test"
 check "webhelper wrapped" 'grep -aq BURROW-WEBHELPER-WRAPPER-1 "$sroot/bin/cef/cef.win64/steamwebhelper.exe"'
 check "Valve helper kept as _real" '[ -f "$sroot/bin/cef/cef.win64/steamwebhelper_real.exe" ]'
@@ -119,6 +120,15 @@ for _ in 1 2 3 4 5 6 7 8 9 10; do "$burrow" usage --ram --plain | grep -qi "note
 check "usage --ram finds a running program in its bottle" '"$burrow" usage --ram --plain | grep -qi "^PROC	Games	notepad.exe	[0-9]*	[0-9]"'
 check "usage human output" '"$burrow" usage | grep -q "Memory (RAM)"'
 "$burrow" kill Games >/dev/null 2>&1
+
+# Same program name in two bottles: both stay in the library.
+"$burrow" bottle new Other >/dev/null
+"$burrow" add "Direct" --bottle Other --exe 'C:\windows\notepad.exe' >/dev/null
+check "same name in another bottle gets its own entry" '[ -f "$BURROW_HOME/library/direct.app.conf" ] && grep -qx "bottle=Other" "$BURROW_HOME/library/direct-2.app.conf"'
+"$burrow" add "Direct" --bottle Other --exe 'C:\windows\regedit.exe' >/dev/null
+check "re-adding in the same bottle replaces its entry" '[ ! -f "$BURROW_HOME/library/direct-3.app.conf" ] && grep -q "regedit" "$BURROW_HOME/library/direct-2.app.conf"'
+"$burrow" bottle delete Other --yes >/dev/null
+check "bottle delete keeps other bottles' apps" '[ ! -f "$BURROW_HOME/library/direct-2.app.conf" ] && [ -f "$BURROW_HOME/library/direct.app.conf" ]'
 "$burrow" remove Direct >/dev/null
 check "remove" '! "$burrow" apps | grep -q Direct'
 "$burrow" bottle delete Games --yes >/dev/null

@@ -1,6 +1,7 @@
 # Credits and licenses
 
-Burrow's own code (`bin/`, `app/`, `wrapper/`, `install.sh`, `tests/`) is by Kyle (Swollzy).
+Burrow's own code (`bin/`, `app/`, `wrapper/`, `install.sh`, `tests/`, `scripts/`) is by
+Kyle (Swollzy), under the MIT license in `LICENSE`.
 
 Burrow does not include Wine, DXMT, Steam or anything from Apple. `burrow setup` downloads
 them from their own projects, under their own licenses:

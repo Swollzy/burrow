@@ -1,8 +1,15 @@
-# Burrow (working name)
+# Burrow
+
+[![CI](https://github.com/Swollzy/burrow/actions/workflows/ci.yml/badge.svg)](https://github.com/Swollzy/burrow/actions/workflows/ci.yml)
 
 Run Windows programs and **Windows Steam** on a Mac, the way CrossOver does: each program
-lives in its own "bottle" (a private Windows folder), and you open them from Burrow's menu
+lives in its own "bottle" (a private Windows folder), and you open them from Burrow's window
 or from Mac shortcuts in your Dock.
+
+> **Status: early.** The command-line tool is tested against Linux Wine, and CI compiles the
+> Mac window on every push, but Burrow hasn't been run end to end on a real Mac yet. Expect
+> rough edges, and send the log from `~/Library/Application Support/Burrow/logs` when
+> something fails.
 
 Burrow is a launcher. The heavy lifting is done by free open source projects that it
 downloads from their own sites during setup:
@@ -16,7 +23,9 @@ downloads from their own sites during setup:
 
 ## Install (on the Mac)
 
-1. Unzip `Burrow.zip` in Downloads.
+1. Download `Burrow-<version>.zip` from the
+   [latest release](https://github.com/Swollzy/burrow/releases/latest) (or **Code → Download
+   ZIP** on this page) and unzip it in Downloads.
 2. Open **Terminal**, type `bash ` (with a space), drag `install.sh` from the Burrow
    folder into the window, and press Return. This is the only Terminal step.
 3. If Apple's free Command Line Tools aren't installed, a macOS window asks to install
@@ -97,12 +106,34 @@ logs). Each launch writes a log to `logs/` there, which is what to send when a g
   version could use a copy you download from Apple yourself.
 - Rosetta 2 is being phased out after macOS 27 (Apple is keeping a subset for games).
 
-## Tests
+## Development
+
+```
+bin/burrow                 the whole CLI (bash 3.2, as shipped with macOS)
+app/BurrowApp.swift        the SwiftUI window; runs bin/burrow for everything
+app/Burrow.applescript     fallback menu when the window can't be compiled
+engine/wine-patches/       Wine patches for turbo graphics (from Neutron)
+wrapper/                   the steamwebhelper wrapper (source and prebuilt .exe)
+tests/                     Linux Wine tests with small Windows test programs
+scripts/package.sh         builds dist/Burrow-<version>.zip
+```
 
 `tests/run-tests.sh` runs Burrow against Linux Wine with small Windows test programs
-(`tests/mocks/`): bottles, installer shortcuts, launching, the Steam wrapper and re-wrap
-after an update, Steam library parsing and launching by name. It can't test anything
-Mac-specific (Rosetta, osacompile, Metal, the turbo build).
+(`tests/mocks/`): bottles, installer shortcuts, launching, the library, the Steam wrapper and
+re-wrap after an update, Steam library parsing and launching by name, and the usage report.
+It needs `wine`, `x86_64-w64-mingw32-gcc` and (without a display) `xvfb-run`. It can't test
+anything Mac-specific (Rosetta, Metal, the turbo build).
+
+CI (`.github/workflows/ci.yml`) runs ShellCheck and those tests on Linux, and on macOS
+checks the scripts with the system bash 3.2, compiles the window app for Apple Silicon and
+Intel, compiles the fallback menu and runs `burrow app`. Pushing a tag like `v0.2.1` that
+matches `BURROW_VERSION` in `bin/burrow` publishes the zip as a GitHub release.
 
 Rebuild the wrapper with:
 `x86_64-w64-mingw32-gcc -O2 -municode -mwindows -static -s -o wrapper/steamwebhelper.exe wrapper/steamwebhelper-wrapper.c`
+
+## License
+
+Burrow's own code is MIT (see `LICENSE`). Wine, DXMT and Steam are downloaded from their own
+projects at setup time and never bundled; see `NOTICE.md` for credits and the licenses of the
+included Wine patches.

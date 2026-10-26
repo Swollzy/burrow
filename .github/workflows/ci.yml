@@ -1,0 +1,70 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  linux:
+    name: Tests (Linux Wine)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Wine, MinGW and ShellCheck
+        run: |
+          sudo dpkg --add-architecture i386
+          sudo apt-get update -qq
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq wine64 wine mingw-w64 shellcheck xvfb
+      - name: ShellCheck
+        run: shellcheck -S warning -s bash bin/burrow install.sh tests/run-tests.sh scripts/package.sh
+      - name: Steam wrapper builds
+        run: x86_64-w64-mingw32-gcc -O2 -municode -mwindows -static -s -o /tmp/steamwebhelper.exe wrapper/steamwebhelper-wrapper.c
+      - name: Tests
+        run: tests/run-tests.sh
+
+  macos:
+    name: Mac app builds
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - name: Scripts parse with the system bash 3.2
+        run: /bin/bash -n bin/burrow && /bin/bash -n install.sh
+      - name: Compile the window app
+        run: |
+          swiftc -O -swift-version 5 -parse-as-library -target arm64-apple-macos13.0 app/BurrowApp.swift -o /tmp/Burrow-arm64
+          swiftc -O -swift-version 5 -parse-as-library -target x86_64-apple-macos13.0 app/BurrowApp.swift -o /tmp/Burrow-x86_64
+      - name: Compile the simple menu app
+        run: |
+          sed 's|__BURROW_CLI__|/tmp/burrow|' app/Burrow.applescript > /tmp/Burrow.applescript
+          osacompile -l AppleScript -o /tmp/Burrow.app /tmp/Burrow.applescript
+      - name: burrow app builds Burrow.app
+        run: |
+          export BURROW_HOME="$RUNNER_TEMP/burrow-home"
+          bin/burrow app "$RUNNER_TEMP/Burrow.app"
+          test -x "$RUNNER_TEMP/Burrow.app/Contents/MacOS/Burrow"
+          bin/burrow status
+          bin/burrow doctor
+
+  release:
+    name: Release zip
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [linux, macos]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - name: Package
+        id: pkg
+        run: |
+          tag="${GITHUB_REF_NAME#v}"
+          version=$(sed -n 's/^BURROW_VERSION="\(.*\)"$/\1/p' bin/burrow)
+          [ "$tag" = "$version" ] || { echo "tag $GITHUB_REF_NAME doesn't match BURROW_VERSION $version"; exit 1; }
+          echo "zip=$(scripts/package.sh)" >> "$GITHUB_OUTPUT"
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: ${{ steps.pkg.outputs.zip }}
+          generate_release_notes: true
