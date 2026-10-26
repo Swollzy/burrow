@@ -7,7 +7,7 @@
 # no mapfile. Run `burrow help` for the commands.
 set -u
 
-BURROW_VERSION="0.2.1"
+BURROW_VERSION="0.2.2"
 
 # --- Paths and pinned downloads -------------------------------------------------------
 BURROW_HOME="${BURROW_HOME:-$HOME/Library/Application Support/Burrow}"
@@ -770,9 +770,9 @@ cmd_app() { # builds Burrow.app: the windowed app, or the simple menu if Swift i
 
 # The windowed app (app/BurrowApp.swift), compiled with the Command Line Tools' swiftc.
 build_window_app() { # dest
-  local dest="$1" src="$APPDIR/app/BurrowApp.swift" swiftc
+  local dest="$1" src="$APPDIR/app/BurrowApp.swift"
   [ -f "$src" ] || return 1
-  if ! xcode-select -p >/dev/null 2>&1 || ! swiftc=$(xcrun --find swiftc 2>/dev/null); then
+  if ! xcode-select -p >/dev/null 2>&1 || ! xcrun --find swiftc >/dev/null 2>&1; then
     warn "Apple's Command Line Tools aren't installed, so Burrow gets its simple menu for now."
     warn "Install them (xcode-select --install), then run: burrow app"
     return 1
@@ -782,7 +782,8 @@ build_window_app() { # dest
   step "Building the Burrow window app…"
   local tmp; tmp=$(mktemp -d -t burrow-app) || return 1
   local log="$LOGS/app-build.log"
-  if ! "$swiftc" -O -swift-version 5 -parse-as-library -target "$(uname -m)-apple-macos13.0" \
+  # Through xcrun so swiftc is told where the macOS SDK is; run bare it can't find it.
+  if ! xcrun --sdk macosx swiftc -O -swift-version 5 -parse-as-library -target "$(uname -m)-apple-macos13.0" \
         "$src" -o "$tmp/Burrow" > "$log" 2>&1; then
     warn "The window app didn't compile (details in $log); using the simple menu."
     rm -rf "$tmp"

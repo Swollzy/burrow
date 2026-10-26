@@ -44,7 +44,7 @@ jobs:
         run: |
           export BURROW_HOME="$RUNNER_TEMP/burrow-home"
           bin/burrow app "$RUNNER_TEMP/Burrow.app"
-          test -x "$RUNNER_TEMP/Burrow.app/Contents/MacOS/Burrow"
+          test -x "$RUNNER_TEMP/Burrow.app/Contents/MacOS/Burrow" || { cat "$BURROW_HOME/logs/app-build.log"; exit 1; }
           bin/burrow status
           bin/burrow doctor
 

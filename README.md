@@ -126,7 +126,7 @@ anything Mac-specific (Rosetta, Metal, the turbo build).
 
 CI (`.github/workflows/ci.yml`) runs ShellCheck and those tests on Linux, and on macOS
 checks the scripts with the system bash 3.2, compiles the window app for Apple Silicon and
-Intel, compiles the fallback menu and runs `burrow app`. Pushing a tag like `v0.2.1` that
+Intel, compiles the fallback menu and runs `burrow app`. Pushing a tag like `v0.2.2` that
 matches `BURROW_VERSION` in `bin/burrow` publishes the zip as a GitHub release.
 
 Rebuild the wrapper with:
