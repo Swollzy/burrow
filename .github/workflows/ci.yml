@@ -18,10 +18,10 @@ jobs:
         # An apt mirror can stall; fail fast rather than hang for hours.
         timeout-minutes: 12
         run: |
-          sudo dpkg --add-architecture i386
+          # 64-bit Wine only: the tests don't need 32-bit, and adding i386 pulls in hundreds of packages.
           echo 'Acquire::Retries "3"; Acquire::http::Timeout "30";' | sudo tee /etc/apt/apt.conf.d/80-burrow-ci >/dev/null
-          sudo apt-get update -qq
-          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq wine64 wine mingw-w64 shellcheck xvfb
+          sudo apt-get update
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y wine64 wine mingw-w64 shellcheck xvfb
       - name: ShellCheck
         run: shellcheck -S warning -s bash bin/burrow install.sh tests/run-tests.sh scripts/package.sh
       - name: Steam wrapper builds
