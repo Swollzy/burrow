@@ -1,4 +1,5 @@
 #!/bin/bash
+# shellcheck disable=SC2034  # variables here are read inside check's eval strings
 # Exercises Burrow's logic with Linux Wine and small Windows test programs (tests/mocks).
 # Nothing here can check the Mac parts (Rosetta, osacompile, Metal); those need a Mac.
 #   tests/run-tests.sh            (needs wine and x86_64-w64-mingw32-gcc)
@@ -39,6 +40,16 @@ ran="$BURROW_HOME/bottles/Games/prefix/drive_c/burrow-test/ran.txt"
 check "launch runs the program" '[ -f "$ran" ]'
 check "launch passes shortcut arguments" 'grep -aq -- "--from-shortcut" "$ran" 2>/dev/null || iconv -f utf-16le -t utf-8 "$ran" 2>/dev/null | grep -q -- "--from-shortcut"'
 check "launch uses the program folder" 'tr -d "\000" < "$ran" | grep -q "cwd=C:\\\\Program Files\\\\Fake App"'
+
+# Per-app settings reach the program's environment.
+"$burrow" settings --app "fake app" env="BURROW_TEST_VAR=hello" cpu_cores=2 >/dev/null
+"$burrow" launch "fake app" >/dev/null 2>&1
+lastlog=$(ls -t "$BURROW_HOME"/logs/fake-app-*.log | head -1)
+check "app env and cpu cores reach the program" 'grep -q "^BURROW_TEST_VAR=hello$" "$lastlog" && grep -q "^WINE_CPU_TOPOLOGY=2:0,1$" "$lastlog"'
+check "app setting shows where it came from" '"$burrow" settings --app "fake app" --plain | grep -q "^cpu_cores	2	app	int	"'
+check "bottle-only settings are refused per app" '! "$burrow" settings --app "fake app" retina on 2>/dev/null'
+"$burrow" add "Outside" --bottle Games --exe "$work/fakeapp.exe" >/dev/null
+check "a program outside the bottle is reached through Z:" 'grep -q "^target=Z:.*\\\\fakeapp.exe$" "$BURROW_HOME/library/outside.app.conf"'
 
 "$burrow" add "Direct" --bottle Games --exe 'C:\Program Files\Fake App\Fake App.exe' --args "--hello" >/dev/null
 rm -f "$ran"; "$burrow" launch Direct >/dev/null 2>&1
@@ -91,7 +102,6 @@ check "steam games lists both libraries" '[ "$("$burrow" steam games | wc -l)" -
 check "steam games skips redistributables" '! "$burrow" steam games | grep -q 228980'
 
 "$burrow" steam >/dev/null 2>&1
-# shellcheck disable=SC2034  # used inside check's eval strings
 st="$BURROW_HOME/bottles/Steam/prefix/drive_c/burrow-test"
 check "webhelper wrapped" 'grep -aq BURROW-WEBHELPER-WRAPPER-1 "$sroot/bin/cef/cef.win64/steamwebhelper.exe"'
 check "Valve helper kept as _real" '[ -f "$sroot/bin/cef/cef.win64/steamwebhelper_real.exe" ]'
@@ -119,6 +129,57 @@ check "usage lists bottles, games and free space" 'out=$("$burrow" usage --plain
 for _ in 1 2 3 4 5 6 7 8 9 10; do "$burrow" usage --ram --plain | grep -qi "notepad.exe" && break; sleep 1; done
 check "usage --ram finds a running program in its bottle" '"$burrow" usage --ram --plain | grep -qi "^PROC	Games	notepad.exe	[0-9]*	[0-9]"'
 check "usage human output" '"$burrow" usage | grep -q "Memory (RAM)"'
+"$burrow" kill Games >/dev/null 2>&1
+
+# Settings, presets and the registry.
+"$burrow" bottle new Tweak --preset apps >/dev/null 2>&1
+ureg="$BURROW_HOME/bottles/Tweak/prefix/user.reg"
+check "apps preset turns on Retina and Cmd as Ctrl" 'grep -q "^\"RetinaMode\"=\"y\"" "$ureg" && grep -q "^\"LeftCommandIsCtrl\"=\"y\"" "$ureg"'
+"$burrow" settings Tweak windows_version=win7 dpi=144 virtual_desktop=1024x768 >/dev/null 2>&1
+check "settings set the Windows version" 'grep -q "^\"Version\"=\"win7\"" "$ureg"'
+check "settings set the DPI" 'grep -q "^\"LogPixels\"=dword:00000090" "$BURROW_HOME/bottles/Tweak/prefix/system.reg"'
+check "virtual desktop on" 'grep -q "^\"Desktop\"=\"Burrow\"" "$ureg" && grep -q "^\"Burrow\"=\"1024x768\"" "$ureg"'
+"$burrow" settings Tweak virtual_desktop off >/dev/null 2>&1
+check "virtual desktop off" '! grep -q "^\"Desktop\"=\"Burrow\"" "$ureg"'
+check "bad values are refused" '! "$burrow" settings Tweak dpi 9999 2>/dev/null && ! "$burrow" settings Tweak retina maybe 2>/dev/null && ! "$burrow" settings Tweak nonsense 1 2>/dev/null && ! "$burrow" settings Tweak env "1BAD" 2>/dev/null'
+check "a refused change changes nothing" '! "$burrow" settings Tweak cpu_cores=4 dpi=1 2>/dev/null; [ "$("$burrow" settings Tweak cpu_cores)" = 0 ]'
+check "settings --plain" '"$burrow" settings Tweak --plain | grep -q "^windows_version	win7	bottle	choice	"'
+"$burrow" settings Tweak preset retro >/dev/null 2>&1
+check "a preset replaces the settings" '[ "$("$burrow" settings Tweak windows_version)" = winxp64 ] && [ "$("$burrow" settings Tweak dpi)" = 96 ] && [ "$("$burrow" settings Tweak virtual_desktop)" = 1024x768 ]'
+check "presets --plain" '[ "$("$burrow" presets --plain | wc -l)" -eq 5 ]'
+check "bottle list --plain" '"$burrow" bottle list --plain | grep -q "^Tweak	compat	winxp64	retro	1024x768$"'
+
+# Snapshots and copies.
+echo keep > "$BURROW_HOME/bottles/Tweak/prefix/drive_c/marker.txt"
+"$burrow" snapshot save Tweak "before" >/dev/null
+snap=$("$burrow" snapshot list Tweak --plain | cut -f1 | head -1)
+check "snapshot list --plain" '"$burrow" snapshot list Tweak --plain | grep -q "	before	"'
+rm -f "$BURROW_HOME/bottles/Tweak/prefix/drive_c/marker.txt"
+"$burrow" settings Tweak windows_version win11 >/dev/null 2>&1
+"$burrow" snapshot restore Tweak "$snap" >/dev/null
+check "snapshot restore brings files and settings back" '[ -f "$BURROW_HOME/bottles/Tweak/prefix/drive_c/marker.txt" ] && [ "$("$burrow" settings Tweak windows_version)" = winxp64 ]'
+check "usage counts snapshots" '"$burrow" usage --plain | grep -q "^DISK	snapshot	Snapshots	"'
+"$burrow" snapshot delete Tweak "$snap" >/dev/null
+check "snapshot delete" '[ -z "$("$burrow" snapshot list Tweak --plain)" ]'
+"$burrow" bottle clone Tweak Tweak2 >/dev/null
+check "bottle clone copies files and settings" '[ -f "$BURROW_HOME/bottles/Tweak2/prefix/drive_c/marker.txt" ] && [ "$("$burrow" settings Tweak2 windows_version)" = winxp64 ]'
+
+# Windows components, with a stand-in for winetricks.
+cat > "$work/winetricks" <<'SH'
+#!/bin/sh
+echo "$WINEPREFIX $*" > "$WINEPREFIX/fake-winetricks.txt"
+for v; do case "$v" in -*) ;; *) echo "$v" >> "$WINEPREFIX/winetricks.log" ;; esac; done
+SH
+chmod +x "$work/winetricks"
+BURROW_WINETRICKS="$work/winetricks" "$burrow" components Tweak install vcrun2022 corefonts >/dev/null 2>&1
+check "components run winetricks in the bottle" 'grep -q "Tweak/prefix --unattended vcrun2022 corefonts$" "$BURROW_HOME/bottles/Tweak/prefix/fake-winetricks.txt"'
+check "components list marks what's installed" '"$burrow" components Tweak list --plain | grep -q "^vcrun2022	1	" && "$burrow" components Tweak list --plain | grep -q "^dotnet48	0	"'
+check "component names are checked" '! BURROW_WINETRICKS="$work/winetricks" "$burrow" components Tweak install --evil 2>/dev/null'
+
+# The Windows desktop window.
+BURROW_FOREGROUND=0 "$burrow" desktop Games 800x600 >/dev/null 2>&1
+for _ in 1 2 3 4 5 6 7 8 9 10; do ps -axww -o command= | grep -q "[d]esktop=Burrow,800x600" && break; sleep 1; done
+check "desktop opens a Windows desktop window" 'ps -axww -o command= | grep -q "[d]esktop=Burrow,800x600"'
 "$burrow" kill Games >/dev/null 2>&1
 
 # Same program name in two bottles: both stay in the library.

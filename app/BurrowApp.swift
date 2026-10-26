@@ -45,6 +45,114 @@ struct BurrowStatus {
     var loaded: Bool { !flags.isEmpty }
 }
 
+struct BottleInfo: Identifiable, Hashable {
+    let id: String  // the bottle's name
+    let graphics: String
+    let windows: String
+    let preset: String
+    let desktop: String
+}
+
+/// One row of `burrow settings … --plain`.
+struct SettingItem: Identifiable, Hashable {
+    let id: String  // key
+    var value: String  // for an app, "" means "same as its bottle"
+    let inherited: String  // the value that applies when nothing is set here
+    let type: String  // bool, int, choice, text
+    let choices: [String]
+    let defaultValue: String
+    let detail: String
+}
+
+struct SnapshotInfo: Identifiable, Hashable {
+    let id: String
+    let label: String
+    let created: String
+}
+
+struct ComponentInfo: Identifiable, Hashable {
+    let id: String  // winetricks name
+    let installed: Bool
+    let detail: String
+}
+
+struct PresetInfo: Identifiable, Hashable {
+    let id: String
+    let detail: String
+}
+
+/// Whose settings a settings sheet edits: a bottle, or one app in it.
+struct SettingsTarget: Hashable {
+    var bottle: String
+    var appID: String? = nil
+    var appName: String? = nil
+    var cliArgs: [String] { appID.map { ["settings", "--app", $0] } ?? ["settings", bottle] }
+    var title: String { appName.map { "Settings for \($0)" } ?? "Settings for bottle “\(bottle)”" }
+}
+
+enum ActiveSheet: Identifiable {
+    case install(URL, String?)  // installer, bottle to preselect
+    case newBottle
+    case settings(SettingsTarget)
+    case snapshots(String)
+    case components(String)
+
+    var id: String {
+        switch self {
+        case .install(let url, _): return "install:" + url.path
+        case .newBottle: return "new-bottle"
+        case .settings(let t): return "settings:\(t.bottle):\(t.appID ?? "")"
+        case .snapshots(let b): return "snapshots:" + b
+        case .components(let b): return "components:" + b
+        }
+    }
+}
+
+func tabRows(_ out: String) -> [[String]] {
+    out.split(separator: "\n").map { $0.split(separator: "\t", omittingEmptySubsequences: false).map(String.init) }
+}
+
+/// Friendlier names for setting keys and values.
+func settingTitle(_ key: String) -> String {
+    switch key {
+    case "graphics": return "Graphics"
+    case "windows_version": return "Windows version"
+    case "virtual_desktop": return "Windows desktop window"
+    case "retina": return "Retina resolution"
+    case "dpi": return "Scale (DPI)"
+    case "option_as_alt": return "Option key is Alt"
+    case "command_as_ctrl": return "Command key is Ctrl"
+    case "fullscreen_capture": return "Fullscreen takes over the display"
+    case "msync": return "Fast syncing (msync)"
+    case "cpu_cores": return "CPU core limit"
+    case "hud": return "Performance HUD"
+    case "wine_debug": return "Logging"
+    case "dll_overrides": return "DLL overrides"
+    case "env": return "Environment variables"
+    case "args": return "Launch options"
+    default: return key
+    }
+}
+
+func choiceTitle(_ value: String) -> String {
+    switch value {
+    case "auto": return "Auto"
+    case "turbo": return "Turbo (Metal)"
+    case "compat": return "Compatible (OpenGL)"
+    case "win11": return "Windows 11"
+    case "win10": return "Windows 10"
+    case "win81": return "Windows 8.1"
+    case "win8": return "Windows 8"
+    case "win7": return "Windows 7"
+    case "vista": return "Windows Vista"
+    case "winxp64": return "Windows XP"
+    case "off": return "Off"
+    case "errors": return "Errors"
+    case "verbose": return "Verbose"
+    default: return value
+    }
+}
+
 func humanKB(_ kb: Double) -> String {
     if kb >= 1_048_576 { return String(format: "%.1f GB", kb / 1_048_576) }
     if kb >= 1024 { return String(format: "%.0f MB", kb / 1024) }
@@ -54,8 +162,16 @@ func humanKB(_ kb: Double) -> String {
 // MARK: - Model
 
 final class BurrowModel: ObservableObject {
+    /// One model for the whole app, so the app delegate can hand it files opened from Finder.
+    static let shared = BurrowModel()
+
     @Published var status = BurrowStatus()
     @Published var apps: [LibraryApp] = []
+    @Published var bottles: [BottleInfo] = []
+    @Published var presets: [PresetInfo] = []
+    @Published var activeSheet: ActiveSheet?
+    @Published var alertText: String?
+    private var autoSetupTried = false
     @Published var games: [SteamGame] = []
     @Published var disk: [DiskRow] = []
     @Published var diskTotal: Double = 0
@@ -73,7 +189,7 @@ final class BurrowModel: ObservableObject {
     let home: String
     let cli: String
 
-    init() {
+    private init() {
         let env = ProcessInfo.processInfo.environment
         home = env["BURROW_HOME"] ?? (NSHomeDirectory() + "/Library/Application Support/Burrow")
         cli = env["BURROW_CLI"] ?? (home + "/app/bin/burrow")
@@ -111,6 +227,55 @@ final class BurrowModel: ObservableObject {
                 text = ""
             }
             DispatchQueue.main.async { done(text) }
+        }
+    }
+
+    /// Runs a command and hands back its exit status and everything it printed, errors included.
+    func run(_ args: [String], done: @escaping (Int32, String) -> Void) {
+        guard cliExists else { done(1, "Burrow's command-line tool is missing at \(cli). Run install.sh again."); return }
+        let p = makeProcess(args)
+        let pipe = Pipe()
+        p.standardOutput = pipe
+        p.standardError = pipe
+        DispatchQueue.global(qos: .userInitiated).async {
+            var text = ""
+            var code: Int32 = 1
+            do {
+                try p.run()
+                let data = pipe.fileHandleForReading.readDataToEndOfFile()
+                p.waitUntilExit()
+                text = String(decoding: data, as: UTF8.self)
+                code = p.terminationStatus
+            } catch {
+                text = error.localizedDescription
+            }
+            DispatchQueue.main.async { done(code, text.trimmingCharacters(in: .whitespacesAndNewlines)) }
+        }
+    }
+
+    /// Like `run`, but shows what went wrong in an alert.
+    func runOrAlert(_ args: [String], then: (() -> Void)? = nil) {
+        run(args) { [weak self] code, out in
+            if code != 0 { self?.alertText = out.isEmpty ? "That didn't work." : out }
+            then?()
+        }
+    }
+
+    /// Closes the open sheet first, then does something that may open another sheet
+    /// (macOS shows one at a time).
+    func afterSheet(_ action: @escaping () -> Void) {
+        activeSheet = nil
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.35, execute: action)
+    }
+
+    func present(_ sheet: ActiveSheet) {
+        if showConsole {
+            showConsole = false
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) { [weak self] in self?.activeSheet = sheet }
+        } else if activeSheet != nil {
+            afterSheet { [weak self] in self?.activeSheet = sheet }
+        } else {
+            activeSheet = sheet
         }
     }
 
@@ -178,6 +343,8 @@ final class BurrowModel: ObservableObject {
     func refreshAll() {
         refreshStatus()
         refreshApps()
+        refreshBottles()
+        refreshPresets()
         refreshGames()
         refreshMemory()
     }
@@ -190,6 +357,32 @@ final class BurrowModel: ObservableObject {
                 if kv.count == 2 { flags[String(kv[0])] = String(kv[1]) }
             }
             self?.status = BurrowStatus(flags: flags)
+            self?.autoSetupIfNeeded()
+        }
+    }
+
+    /// The first time Burrow opens it sets itself up (downloads Wine and DXMT) without being asked.
+    private func autoSetupIfNeeded() {
+        guard !autoSetupTried, status.loaded, status.has("mac"), !status.has("setup"), !jobRunning, cliExists else { return }
+        autoSetupTried = true
+        runJob("Setting up Burrow", ["setup"])
+    }
+
+    func refreshBottles() {
+        capture(["bottle", "list", "--plain"]) { [weak self] out in
+            self?.bottles = tabRows(out).compactMap { f -> BottleInfo? in
+                guard f.count >= 5, !f[0].isEmpty else { return nil }
+                return BottleInfo(id: f[0], graphics: f[1], windows: f[2], preset: f[3], desktop: f[4])
+            }.sorted { $0.id.localizedCaseInsensitiveCompare($1.id) == .orderedAscending }
+        }
+    }
+
+    func refreshPresets() {
+        capture(["presets", "--plain"]) { [weak self] out in
+            self?.presets = tabRows(out).compactMap { f -> PresetInfo? in
+                guard f.count >= 2 else { return nil }
+                return PresetInfo(id: f[0], detail: f[1])
+            }
         }
     }
 
@@ -249,14 +442,73 @@ final class BurrowModel: ObservableObject {
         fire(["launch", app.id] + (compat ? ["--graphics", "compat"] : []))
     }
 
-    func installProgram() {
+    private func pickWindowsFile(_ title: String, types: [String] = ["exe", "msi"]) -> URL? {
         let panel = NSOpenPanel()
-        panel.title = "Pick a Windows installer"
+        panel.title = title
         panel.allowsMultipleSelection = false
         panel.canChooseDirectories = false
-        panel.allowedContentTypes = ["exe", "msi"].compactMap { UTType(filenameExtension: $0) }
-        guard panel.runModal() == .OK, let url = panel.url else { return }
-        runJob("Installing \(url.lastPathComponent)", ["install", url.path])
+        panel.allowedContentTypes = types.compactMap { UTType(filenameExtension: $0) }
+        guard panel.runModal() == .OK else { return nil }
+        return panel.url
+    }
+
+    /// Picks an installer, then asks which bottle it goes in.
+    func installProgram(into bottle: String? = nil) {
+        guard let url = pickWindowsFile("Pick a Windows installer") else { return }
+        present(.install(url, bottle))
+    }
+
+    /// Files dropped on the window or opened from Finder with Burrow.
+    func openFiles(_ urls: [URL]) {
+        guard let url = urls.first(where: { ["exe", "msi"].contains($0.pathExtension.lowercased()) }) else { return }
+        present(.install(url, nil))
+    }
+
+    func install(_ url: URL, bottle: String, preset: String) {
+        var args = ["install", url.path, "--bottle", bottle]
+        if !preset.isEmpty { args += ["--preset", preset] }
+        runJob("Installing \(url.lastPathComponent)", args)
+    }
+
+    /// Runs a program once without installing it (portable programs, tools, patches).
+    func runProgram(in bottle: String) {
+        guard let url = pickWindowsFile("Pick a Windows program to run", types: ["exe", "msi", "bat"]) else { return }
+        fire(["run", bottle, url.path])
+    }
+
+    /// Puts a program that's already on the Mac (a portable app) in the library.
+    func addProgram(in bottle: String) {
+        guard let url = pickWindowsFile("Pick a Windows program", types: ["exe"]) else { return }
+        let name = url.deletingPathExtension().lastPathComponent
+        runOrAlert(["add", name, "--bottle", bottle, "--exe", url.path]) { [weak self] in self?.refreshApps() }
+    }
+
+    func newBottle(_ name: String, preset: String) {
+        var args = ["bottle", "new", name]
+        if !preset.isEmpty { args += ["--preset", preset] }
+        runJob("Creating bottle \(name)", args)
+    }
+
+    func duplicateBottle(_ bottle: String) {
+        var name = "\(bottle) copy"
+        var n = 2
+        while bottles.contains(where: { $0.id == name }) { name = "\(bottle) copy \(n)"; n += 1 }
+        runJob("Copying bottle \(bottle)", ["bottle", "clone", bottle, name])
+    }
+
+    func deleteBottle(_ bottle: String) {
+        runOrAlert(["bottle", "delete", bottle, "--yes"]) { [weak self] in
+            self?.refreshBottles()
+            self?.refreshApps()
+        }
+    }
+
+    func openDesktop(_ bottle: String) { fire(["desktop", bottle]) }
+
+    func wineSettings(_ bottle: String) { fire(["winecfg", bottle]) }
+
+    func openDrive(_ bottle: String) {
+        NSWorkspace.shared.open(URL(fileURLWithPath: home + "/bottles/" + bottle + "/prefix/drive_c"))
     }
 
     func makeShortcut(_ app: LibraryApp) {
@@ -305,18 +557,33 @@ final class BurrowModel: ObservableObject {
 
 // MARK: - Views
 
+/// Hands .exe and .msi files opened from Finder ("Open With > Burrow") to the window.
+final class AppDelegate: NSObject, NSApplicationDelegate {
+    func application(_ application: NSApplication, open urls: [URL]) {
+        DispatchQueue.main.async { BurrowModel.shared.openFiles(urls) }
+    }
+
+    func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { true }
+}
+
 @main
 struct BurrowApp: App {
-    @StateObject private var model = BurrowModel()
+    @NSApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
+    @StateObject private var model = BurrowModel.shared
 
     var body: some Scene {
         WindowGroup("Burrow") {
             ContentView()
                 .environmentObject(model)
-                .frame(minWidth: 780, minHeight: 540)
+                .frame(minWidth: 840, minHeight: 560)
         }
         .commands {
-            CommandGroup(replacing: .newItem) {}
+            CommandGroup(replacing: .newItem) {
+                Button("Install Windows Program…") { model.installProgram() }
+                    .keyboardShortcut("o")
+                Button("New Bottle…") { model.present(.newBottle) }
+                    .keyboardShortcut("n")
+            }
         }
     }
 }
@@ -326,24 +593,56 @@ struct ContentView: View {
     @State private var tab = 0
     @State private var choseStartTab = false
 
+    private let setupTab = 4
+
     var body: some View {
-        TabView(selection: $tab) {
-            LibraryView(goToSetup: { tab = 3 })
-                .tabItem { Label("Library", systemImage: "square.grid.2x2") }.tag(0)
-            SteamView()
-                .tabItem { Label("Steam", systemImage: "gamecontroller") }.tag(1)
-            UsageView()
-                .tabItem { Label("Usage", systemImage: "internaldrive") }.tag(2)
-            SetupView()
-                .tabItem { Label("Setup", systemImage: "wrench.and.screwdriver") }.tag(3)
+        VStack {
+            TabView(selection: $tab) {
+                LibraryView(goToSetup: { tab = setupTab })
+                    .tabItem { Label("Library", systemImage: "square.grid.2x2") }.tag(0)
+                BottlesView()
+                    .tabItem { Label("Bottles", systemImage: "shippingbox") }.tag(1)
+                SteamView()
+                    .tabItem { Label("Steam", systemImage: "gamecontroller") }.tag(2)
+                UsageView()
+                    .tabItem { Label("Usage", systemImage: "internaldrive") }.tag(3)
+                SetupView()
+                    .tabItem { Label("Setup", systemImage: "wrench.and.screwdriver") }.tag(setupTab)
+            }
+            .padding()
+            .sheet(isPresented: $model.showConsole) { ConsoleView().environmentObject(model) }
         }
-        .padding()
-        .sheet(isPresented: $model.showConsole) { ConsoleView().environmentObject(model) }
+        .sheet(item: $model.activeSheet) { sheet in
+            Group {
+                switch sheet {
+                case .install(let url, let bottle): InstallSheet(url: url, preselected: bottle)
+                case .newBottle: NewBottleSheet()
+                case .settings(let target): SettingsSheet(target: target)
+                case .snapshots(let bottle): SnapshotsSheet(bottle: bottle)
+                case .components(let bottle): ComponentsSheet(bottle: bottle)
+                }
+            }
+            .environmentObject(model)
+        }
+        .alert("Burrow", isPresented: Binding(get: { model.alertText != nil }, set: { if !$0 { model.alertText = nil } })) {
+            Button("OK", role: .cancel) {}
+        } message: {
+            Text(model.alertText ?? "")
+        }
+        // Drop a Windows installer anywhere on the window to install it.
+        .onDrop(of: [UTType.fileURL], isTargeted: nil) { providers in
+            guard let provider = providers.first else { return false }
+            _ = provider.loadObject(ofClass: URL.self) { url, _ in
+                guard let url = url else { return }
+                DispatchQueue.main.async { model.openFiles([url]) }
+            }
+            return true
+        }
         // The status arrives a moment after launch; open on Setup until Wine is installed.
         .onReceive(model.$status) { status in
             guard status.loaded, !choseStartTab else { return }
             choseStartTab = true
-            if !status.has("setup") { tab = 3 }
+            if !status.has("setup") { tab = setupTab }
         }
     }
 }
@@ -375,7 +674,7 @@ struct LibraryView: View {
                 VStack(spacing: 8) {
                     Image(systemName: "tray").font(.system(size: 40)).foregroundColor(.secondary)
                     Text("Nothing here yet.").font(.headline)
-                    Text("Install a Windows program, or open the Steam tab and add your Steam games.")
+                    Text("Install a Windows program (or drop its installer here), or open the Steam tab and add your Steam games.")
                         .foregroundColor(.secondary)
                 }
                 .frame(maxWidth: .infinity)
@@ -415,6 +714,11 @@ struct AppCard: View {
                     Button("Play with compatible graphics") { model.launch(app, compat: true) }
                         .disabled(app.isSteamGame)
                     Button("Make a Dock shortcut") { model.makeShortcut(app) }
+                    Button("Settings…") {
+                        model.present(.settings(SettingsTarget(bottle: app.bottle, appID: app.id, appName: app.name)))
+                    }
+                    .disabled(app.isSteamGame)
+                    Button("Bottle Settings…") { model.present(.settings(SettingsTarget(bottle: app.bottle))) }
                     Divider()
                     Button("Remove from library", action: onRemove)
                 } label: { Image(systemName: "ellipsis.circle") }
@@ -728,5 +1032,536 @@ struct ConsoleView: View {
         }
         .padding()
         .frame(minWidth: 640, minHeight: 420)
+    }
+}
+
+// MARK: - Bottles
+
+struct BottlesView: View {
+    @EnvironmentObject var model: BurrowModel
+    @State private var toDelete: String?
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            HStack {
+                Text("Bottles").font(.title2).bold()
+                Spacer()
+                Button { model.refreshBottles() } label: { Label("Refresh", systemImage: "arrow.clockwise") }
+                Button { model.present(.newBottle) } label: { Label("New Bottle…", systemImage: "plus") }
+                    .disabled(!model.status.has("setup"))
+            }
+            Text("Each bottle is its own lightweight Windows install, like a small VM that opens in seconds. Give it its own settings, save a snapshot before a risky change, or open it as a whole Windows desktop.")
+                .foregroundColor(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+            if model.bottles.isEmpty {
+                Spacer()
+                VStack(spacing: 8) {
+                    Image(systemName: "shippingbox").font(.system(size: 40)).foregroundColor(.secondary)
+                    Text("No bottles yet.").font(.headline)
+                    Text("Installing a program makes one, or press New Bottle.").foregroundColor(.secondary)
+                }
+                .frame(maxWidth: .infinity)
+                Spacer()
+            } else {
+                ScrollView {
+                    VStack(spacing: 10) {
+                        ForEach(model.bottles) { bottle in
+                            BottleRow(bottle: bottle, onDelete: { toDelete = bottle.id })
+                        }
+                    }
+                    .padding(.vertical, 4)
+                }
+            }
+        }
+        .onAppear { model.refreshBottles() }
+        .alert("Delete this bottle?", isPresented: Binding(get: { toDelete != nil }, set: { if !$0 { toDelete = nil } })) {
+            Button("Delete", role: .destructive) { if let b = toDelete { model.deleteBottle(b) }; toDelete = nil }
+            Button("Cancel", role: .cancel) { toDelete = nil }
+        } message: {
+            Text("Everything installed in “\(toDelete ?? "")” and all its snapshots will be deleted. This can't be undone.")
+        }
+    }
+}
+
+struct BottleRow: View {
+    @EnvironmentObject var model: BurrowModel
+    let bottle: BottleInfo
+    var onDelete: () -> Void
+
+    private var summary: String {
+        var parts = [choiceTitle(bottle.windows), "graphics: " + choiceTitle(bottle.graphics).lowercased()]
+        if bottle.desktop != "off" { parts.append("desktop window \(bottle.desktop)") }
+        if !bottle.preset.isEmpty { parts.append(bottle.preset.capitalized + " preset") }
+        return parts.joined(separator: " · ")
+    }
+
+    var body: some View {
+        HStack(spacing: 12) {
+            Image(systemName: "shippingbox.fill").font(.title).foregroundColor(.accentColor)
+            VStack(alignment: .leading, spacing: 2) {
+                Text(bottle.id).font(.headline)
+                Text(summary).font(.caption).foregroundColor(.secondary)
+            }
+            Spacer()
+            Button { model.openDesktop(bottle.id) } label: { Label("Windows Desktop", systemImage: "macwindow") }
+                .help("Open this bottle as a whole Windows desktop in one window")
+            Button { model.present(.settings(SettingsTarget(bottle: bottle.id))) } label: {
+                Label("Settings", systemImage: "slider.horizontal.3")
+            }
+            Menu {
+                Button("Install Windows Program…") { model.installProgram(into: bottle.id) }
+                Button("Run a Program Once (.exe)…") { model.runProgram(in: bottle.id) }
+                Button("Add a Program to the Library (.exe)…") { model.addProgram(in: bottle.id) }
+                Divider()
+                Button("Snapshots…") { model.present(.snapshots(bottle.id)) }
+                Button("Windows Components…") { model.present(.components(bottle.id)) }
+                Button("Duplicate Bottle") { model.duplicateBottle(bottle.id) }
+                Divider()
+                Button("Show C: Drive in Finder") { model.openDrive(bottle.id) }
+                Button("Wine Settings (winecfg)") { model.wineSettings(bottle.id) }
+                Button("Quit Its Programs") { model.stopBottle(bottle.id) }
+                Divider()
+                Button("Delete Bottle…", role: .destructive, action: onDelete)
+            } label: { Image(systemName: "ellipsis.circle") }
+            .menuStyle(.borderlessButton)
+            .frame(width: 28)
+        }
+        .padding(12)
+        .background(RoundedRectangle(cornerRadius: 10).fill(Color(nsColor: .controlBackgroundColor)))
+        .overlay(RoundedRectangle(cornerRadius: 10).stroke(Color.secondary.opacity(0.2)))
+    }
+}
+
+/// Bottle names become folder names; keep them simple.
+func bottleNameProblem(_ name: String) -> String? {
+    let n = name.trimmingCharacters(in: .whitespaces)
+    if n.isEmpty { return "Give the bottle a name." }
+    if n.contains("/") || n.hasPrefix(".") || n.contains("\t") { return "Bottle names can't contain / or start with a dot." }
+    return nil
+}
+
+struct PresetPicker: View {
+    @EnvironmentObject var model: BurrowModel
+    @Binding var preset: String
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Picker("Preset", selection: $preset) {
+                Text("Standard").tag("")
+                ForEach(model.presets) { p in Text(p.id.capitalized).tag(p.id) }
+            }
+            Text(model.presets.first(where: { $0.id == preset })?.detail
+                 ?? "Windows 10 with Burrow's usual settings. You can change any of them later.")
+                .font(.caption).foregroundColor(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+    }
+}
+
+struct NewBottleSheet: View {
+    @EnvironmentObject var model: BurrowModel
+    @State private var name = ""
+    @State private var preset = ""
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            Text("New Bottle").font(.headline)
+            Form {
+                TextField("Name", text: $name, prompt: Text("Games, Office, Old Games…"))
+                PresetPicker(preset: $preset)
+            }
+            if let problem = bottleNameProblem(name), !name.isEmpty {
+                Text(problem).font(.caption).foregroundColor(.red)
+            } else if model.bottles.contains(where: { $0.id == name.trimmingCharacters(in: .whitespaces) }) {
+                Text("There's already a bottle with that name.").font(.caption).foregroundColor(.red)
+            }
+            HStack {
+                Spacer()
+                Button("Cancel") { model.activeSheet = nil }.keyboardShortcut(.cancelAction)
+                Button("Create") {
+                    let n = name.trimmingCharacters(in: .whitespaces)
+                    let p = preset
+                    model.afterSheet { model.newBottle(n, preset: p) }
+                }
+                .keyboardShortcut(.defaultAction)
+                .disabled(bottleNameProblem(name) != nil
+                          || model.bottles.contains(where: { $0.id == name.trimmingCharacters(in: .whitespaces) }))
+            }
+        }
+        .padding()
+        .frame(width: 520)
+    }
+}
+
+struct InstallSheet: View {
+    @EnvironmentObject var model: BurrowModel
+    let url: URL
+    let preselected: String?
+    @State private var intoNew = true
+    @State private var newName = ""
+    @State private var existing = ""
+    @State private var preset = ""
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            Text("Install \(url.lastPathComponent)").font(.headline)
+            Form {
+                Picker("Install into", selection: $intoNew) {
+                    Text("A new bottle").tag(true)
+                    Text("An existing bottle").tag(false).disabled(model.bottles.isEmpty)
+                }
+                .pickerStyle(.radioGroup)
+                if intoNew {
+                    TextField("Bottle name", text: $newName)
+                    PresetPicker(preset: $preset)
+                } else {
+                    Picker("Bottle", selection: $existing) {
+                        ForEach(model.bottles) { b in Text(b.id).tag(b.id) }
+                    }
+                }
+            }
+            Text("Each bottle is a separate Windows install. Programs that work together, like a game and its mods or an app and its plug-ins, should share one.")
+                .font(.caption).foregroundColor(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+            if !model.status.has("setup") {
+                Text("Burrow is still setting up; installing waits until Wine is downloaded.")
+                    .font(.caption).foregroundColor(.orange)
+            }
+            HStack {
+                Spacer()
+                Button("Cancel") { model.activeSheet = nil }.keyboardShortcut(.cancelAction)
+                Button("Install") {
+                    let bottle = intoNew ? newName.trimmingCharacters(in: .whitespaces) : existing
+                    let p = intoNew ? preset : ""
+                    let file = url
+                    model.afterSheet { model.install(file, bottle: bottle, preset: p) }
+                }
+                .keyboardShortcut(.defaultAction)
+                .disabled(intoNew ? bottleNameProblem(newName) != nil : existing.isEmpty)
+            }
+        }
+        .padding()
+        .frame(width: 560)
+        .onAppear {
+            newName = url.deletingPathExtension().lastPathComponent
+            if let b = preselected, model.bottles.contains(where: { $0.id == b }) {
+                intoNew = false
+                existing = b
+            } else {
+                existing = model.bottles.first?.id ?? ""
+            }
+        }
+    }
+}
+
+// MARK: - Settings
+
+struct SettingRow: View {
+    @Binding var item: SettingItem
+    /// An app's settings: "" means "same as the bottle".
+    let inherits: Bool
+
+    private var inheritedLabel: String {
+        let v = item.inherited.isEmpty ? "none" : (item.type == "choice" ? choiceTitle(item.inherited) : item.inherited)
+        return "Same as bottle (\(v))"
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 3) {
+            switch item.type {
+            case "bool":
+                if inherits {
+                    Picker(settingTitle(item.id), selection: $item.value) {
+                        Text(inheritedLabel).tag("")
+                        Text("On").tag("on")
+                        Text("Off").tag("off")
+                    }
+                } else {
+                    Toggle(settingTitle(item.id), isOn: Binding(get: { item.value == "on" },
+                                                                set: { item.value = $0 ? "on" : "off" }))
+                }
+            case "choice":
+                Picker(settingTitle(item.id), selection: $item.value) {
+                    if inherits { Text(inheritedLabel).tag("") }
+                    ForEach(item.choices, id: \.self) { c in Text(choiceTitle(c)).tag(c) }
+                }
+            default:
+                TextField(settingTitle(item.id), text: $item.value,
+                          prompt: Text(inherits ? inheritedLabel : (item.defaultValue.isEmpty ? "none" : item.defaultValue)))
+            }
+            Text(item.detail)
+                .font(.caption).foregroundColor(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+        .padding(.vertical, 2)
+    }
+}
+
+struct SettingsSheet: View {
+    @EnvironmentObject var model: BurrowModel
+    let target: SettingsTarget
+    @State private var items: [SettingItem] = []
+    @State private var original: [String: String] = [:]
+    @State private var loading = true
+    @State private var busy = false
+    @State private var message = ""
+    @State private var failed = false
+    @State private var preset = ""
+
+    private var isApp: Bool { target.appID != nil }
+
+    /// "key=value" for everything changed; an emptied value goes back to the default.
+    private var changes: [String] {
+        items.filter { original[$0.id] != $0.value }
+            .map { "\($0.id)=\($0.value.isEmpty ? "default" : $0.value)" }
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Text(target.title).font(.headline)
+            if isApp {
+                Text("Anything left on “Same as bottle” follows the settings of the bottle “\(target.bottle)”.")
+                    .font(.caption).foregroundColor(.secondary)
+            } else {
+                HStack(alignment: .top) {
+                    PresetPicker(preset: $preset).frame(maxWidth: 360)
+                    Button("Apply Preset") { applyPreset() }.disabled(preset.isEmpty || busy)
+                    Spacer()
+                }
+            }
+            if loading {
+                ProgressView().frame(maxWidth: .infinity, maxHeight: .infinity)
+            } else {
+                Form {
+                    ForEach($items) { $item in SettingRow(item: $item, inherits: isApp) }
+                }
+                .formStyle(.grouped)
+            }
+            if !message.isEmpty {
+                Text(message)
+                    .font(.callout)
+                    .foregroundColor(failed ? .red : .secondary)
+                    .textSelection(.enabled)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            HStack {
+                if busy { ProgressView().controlSize(.small) }
+                Text("Changes apply the next time the bottle's programs start.").font(.caption).foregroundColor(.secondary)
+                Spacer()
+                Button("Cancel") { model.activeSheet = nil }.keyboardShortcut(.cancelAction)
+                Button("Save") { save() }
+                    .keyboardShortcut(.defaultAction)
+                    .disabled(busy || loading || changes.isEmpty)
+            }
+        }
+        .padding()
+        .frame(minWidth: 640, minHeight: 600)
+        .onAppear(perform: load)
+    }
+
+    private func load() {
+        loading = true
+        model.capture(target.cliArgs + ["--plain"]) { out in
+            items = tabRows(out).compactMap { f -> SettingItem? in
+                guard f.count >= 8 else { return nil }
+                // An app shows only what it sets itself; the rest reads "Same as bottle".
+                let value = (isApp && f[2] != "app") ? "" : f[1]
+                return SettingItem(id: f[0], value: value, inherited: f[1], type: f[3],
+                                   choices: f[4].split(separator: " ").map(String.init),
+                                   defaultValue: f[5], detail: f[7])
+            }
+            original = Dictionary(uniqueKeysWithValues: items.map { ($0.id, $0.value) })
+            loading = false
+        }
+    }
+
+    private func save() {
+        busy = true
+        model.run(target.cliArgs + changes) { code, out in
+            busy = false
+            if code == 0 {
+                model.refreshBottles()
+                model.activeSheet = nil
+            } else {
+                failed = true
+                message = out
+            }
+        }
+    }
+
+    private func applyPreset() {
+        busy = true
+        model.run(["settings", target.bottle, "preset", preset]) { code, out in
+            busy = false
+            failed = code != 0
+            message = code == 0 ? "Applied the \(preset.capitalized) preset." : out
+            model.refreshBottles()
+            load()
+        }
+    }
+}
+
+// MARK: - Snapshots
+
+struct SnapshotsSheet: View {
+    @EnvironmentObject var model: BurrowModel
+    let bottle: String
+    @State private var snapshots: [SnapshotInfo] = []
+    @State private var label = ""
+    @State private var busy = false
+    @State private var message = ""
+    @State private var needsForce = false
+    @State private var toRestore: SnapshotInfo?
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Text("Snapshots of “\(bottle)”").font(.headline)
+            Text("A snapshot saves the whole bottle as it is now. Make one before installing mods, updates or anything risky, and roll back if it goes wrong. On a Mac they take seconds and almost no space until the bottle changes.")
+                .font(.callout).foregroundColor(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+            HStack {
+                TextField("Label", text: $label, prompt: Text("Before installing mods"))
+                Button("Take Snapshot") { save(force: false) }.disabled(busy)
+                if needsForce { Button("Quit Programs and Save") { save(force: true) }.disabled(busy) }
+            }
+            if snapshots.isEmpty {
+                Text("No snapshots yet.").foregroundColor(.secondary).frame(maxWidth: .infinity, maxHeight: .infinity)
+            } else {
+                List(snapshots) { s in
+                    HStack {
+                        Image(systemName: "clock.arrow.circlepath")
+                        VStack(alignment: .leading) {
+                            Text(s.label)
+                            Text(s.created).font(.caption).foregroundColor(.secondary)
+                        }
+                        Spacer()
+                        Button("Restore") { toRestore = s }.disabled(busy)
+                        Button(role: .destructive) { delete(s) } label: { Image(systemName: "trash") }
+                            .buttonStyle(.borderless)
+                            .disabled(busy)
+                    }
+                    .padding(.vertical, 2)
+                }
+            }
+            if !message.isEmpty {
+                Text(message).font(.callout).foregroundColor(.secondary).textSelection(.enabled)
+            }
+            HStack {
+                if busy { ProgressView().controlSize(.small) }
+                Spacer()
+                Button("Done") { model.activeSheet = nil }.keyboardShortcut(.defaultAction)
+            }
+        }
+        .padding()
+        .frame(minWidth: 560, minHeight: 440)
+        .onAppear(perform: load)
+        .confirmationDialog("Roll “\(bottle)” back to this snapshot?",
+                            isPresented: Binding(get: { toRestore != nil }, set: { if !$0 { toRestore = nil } })) {
+            Button("Restore", role: .destructive) { if let s = toRestore { restore(s) }; toRestore = nil }
+        } message: {
+            Text("Its programs are closed, and everything changed in the bottle since “\(toRestore?.label ?? "")” is lost.")
+        }
+    }
+
+    private func load() {
+        model.capture(["snapshot", "list", bottle, "--plain"]) { out in
+            snapshots = tabRows(out).compactMap { f -> SnapshotInfo? in
+                guard f.count >= 3 else { return nil }
+                return SnapshotInfo(id: f[0], label: f[1], created: f[2])
+            }.sorted { $0.id > $1.id }
+        }
+    }
+
+    private func save(force: Bool) {
+        busy = true
+        var args = ["snapshot", "save", bottle, label.isEmpty ? "Snapshot" : label]
+        if force { args.append("--force") }
+        model.run(args) { code, out in
+            busy = false
+            needsForce = code != 0 && out.contains("running")
+            message = code == 0 ? "Saved." : out
+            if code == 0 { label = "" }
+            load()
+        }
+    }
+
+    private func restore(_ s: SnapshotInfo) {
+        busy = true
+        model.run(["snapshot", "restore", bottle, s.id]) { code, out in
+            busy = false
+            message = code == 0 ? "Rolled back to “\(s.label)”." : out
+            model.refreshAll()
+        }
+    }
+
+    private func delete(_ s: SnapshotInfo) {
+        busy = true
+        model.run(["snapshot", "delete", bottle, s.id]) { code, out in
+            busy = false
+            message = code == 0 ? "" : out
+            load()
+        }
+    }
+}
+
+// MARK: - Windows components
+
+struct ComponentsSheet: View {
+    @EnvironmentObject var model: BurrowModel
+    let bottle: String
+    @State private var items: [ComponentInfo] = []
+    @State private var selected: Set<String> = []
+    @State private var other = ""
+
+    private var toInstall: [String] {
+        let extra = other.split(whereSeparator: { $0 == " " || $0 == "," }).map(String.init)
+        return Array(selected).sorted() + extra
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Text("Windows components for “\(bottle)”").font(.headline)
+            Text("Some programs need pieces of Windows that Wine doesn't include, like Microsoft's Visual C++ runtimes, .NET or fonts. Burrow installs them with winetricks. Tip: take a snapshot first.")
+                .font(.callout).foregroundColor(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+            List(items) { c in
+                Toggle(isOn: Binding(get: { c.installed || selected.contains(c.id) },
+                                     set: { on in if on { selected.insert(c.id) } else { selected.remove(c.id) } })) {
+                    HStack {
+                        VStack(alignment: .leading) {
+                            Text(c.id).font(.system(.body, design: .monospaced))
+                            Text(c.detail).font(.caption).foregroundColor(.secondary)
+                        }
+                        Spacer()
+                        if c.installed { Text("Installed").font(.caption).foregroundColor(.green) }
+                    }
+                }
+                .disabled(c.installed)
+            }
+            TextField("Other winetricks names", text: $other, prompt: Text("e.g. dotnet6 vcrun2005"))
+            HStack {
+                Spacer()
+                Button("Cancel") { model.activeSheet = nil }.keyboardShortcut(.cancelAction)
+                Button("Install") {
+                    let names = toInstall
+                    model.afterSheet {
+                        model.runJob("Installing \(names.joined(separator: ", ")) into \(bottle)",
+                                     ["components", bottle, "install"] + names)
+                    }
+                }
+                .keyboardShortcut(.defaultAction)
+                .disabled(toInstall.isEmpty)
+            }
+        }
+        .padding()
+        .frame(minWidth: 560, minHeight: 520)
+        .onAppear {
+            model.capture(["components", bottle, "list", "--plain"]) { out in
+                items = tabRows(out).compactMap { f -> ComponentInfo? in
+                    guard f.count >= 3 else { return nil }
+                    return ComponentInfo(id: f[0], installed: f[1] == "1", detail: f[2])
+                }
+            }
+        }
     }
 }

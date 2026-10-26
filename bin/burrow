@@ -7,7 +7,7 @@
 # no mapfile. Run `burrow help` for the commands.
 set -u
 
-BURROW_VERSION="0.2.2"
+BURROW_VERSION="0.3.0"
 
 # --- Paths and pinned downloads -------------------------------------------------------
 BURROW_HOME="${BURROW_HOME:-$HOME/Library/Application Support/Burrow}"
@@ -17,6 +17,7 @@ BOTTLES="$BURROW_HOME/bottles"
 LIBRARY="$BURROW_HOME/library"
 LOGS="$BURROW_HOME/logs"
 CACHE="$BURROW_HOME/cache"
+SNAPSHOTS="$BURROW_HOME/snapshots"
 SHORTCUTS="${BURROW_SHORTCUTS:-$HOME/Applications/Burrow}"
 here="$(cd "$(dirname "$0")" && pwd)"
 APPDIR="$(cd "$here/.." && pwd)"
@@ -105,40 +106,243 @@ engine_wineserver() {
 engine_ok() { engine_wine "$1" >/dev/null 2>&1; }
 best_engine() { if engine_ok "$TURBO_ENGINE"; then echo "$TURBO_ENGINE"; else echo "$STOCK_ENGINE"; fi; }
 
+# --- Settings ------------------------------------------------------------------------------------
+# Every setting has a scope: "bottle" (the whole Windows install, mostly registry), "both" (set
+# on a bottle, and an app in it can override it) or "app" (one program only). Values live in
+# bottle.conf and <app>.app.conf as key=value; a missing key means the default.
+SETTING_KEYS="graphics windows_version virtual_desktop retina dpi option_as_alt command_as_ctrl fullscreen_capture msync cpu_cores hud wine_debug dll_overrides env args"
+
+# key -> "scope|type|default|choices|description"
+setting_meta() {
+  case "$1" in
+    graphics)           echo "both|choice|auto|auto turbo compat|Graphics engine. Turbo draws Direct3D 10/11 with Metal (DXMT); compat uses Wine's OpenGL path (slower, but some older games need it); auto picks turbo when it's built." ;;
+    windows_version)    echo "bottle|choice|win10|win11 win10 win81 win8 win7 vista winxp64|The Windows version programs see. Old games and installers sometimes want win7 or winxp64." ;;
+    virtual_desktop)    echo "bottle|text|off||Run everything in this bottle inside one Windows desktop window, like a VM: off, or a size such as 1920x1080." ;;
+    retina)             echo "bottle|bool|off||Full Retina resolution. Sharper but slower; pair it with dpi 192 so text isn't tiny." ;;
+    dpi)                echo "bottle|int|96||Text and window scale: 96 is 100%, 144 is 150%, 192 is 200%." ;;
+    option_as_alt)      echo "bottle|bool|on||The Option keys act as Alt (games use Alt a lot)." ;;
+    command_as_ctrl)    echo "bottle|bool|off||The Command keys act as Ctrl, so Cmd-C and Cmd-V work in Windows apps. Mac shortcuts like Cmd-Q stop working inside them." ;;
+    fullscreen_capture) echo "bottle|bool|off||Fullscreen programs take over the whole display. Can fix games that change resolution; off keeps Mission Control and Spaces working." ;;
+    msync)              echo "both|bool|on||Fast thread syncing (msync). Turn it off if a program hangs at start." ;;
+    cpu_cores)          echo "both|int|0||Limit how many CPU cores programs see (0 = all). Some older games crash on Macs with many cores." ;;
+    hud)                echo "both|bool|off||Show Apple's Metal performance HUD (frame rate) in turbo graphics." ;;
+    wine_debug)         echo "both|choice|off|off errors verbose|How much Wine writes to the logs. Use errors or verbose when reporting a problem." ;;
+    dll_overrides)      echo "both|text|||Wine DLL overrides, for example d3dx9_43=n,b;xinput1_3=n. An app's overrides are added after its bottle's." ;;
+    env)                echo "both|text|||Extra environment variables, for example DXMT_LOG_LEVEL=info;FOO=1. An app's are added after its bottle's." ;;
+    args)               echo "app|text|||Extra launch options passed to the program." ;;
+    *) return 1 ;;
+  esac
+}
+setting_field() { setting_meta "$1" | cut -d'|' -f"$2"; } # key field-number
+setting_default() { setting_field "$1" 3; }
+
+# Checks a value and prints it in its stored form ("yes" -> "on"). "default" -> empty.
+setting_normalize() { # key value
+  local key="$1" v="$2" type choices
+  type=$(setting_field "$key" 2) || die "unknown setting '$key' (see: burrow settings --list)"
+  case "$v" in *"
+"*) die "values can't contain line breaks" ;; esac
+  [ "$v" = default ] && { printf ''; return 0; }
+  case "$type" in
+    bool)
+      case "$(printf '%s' "$v" | tr '[:upper:]' '[:lower:]')" in
+        on|yes|true|1|y) v=on ;; off|no|false|0|n) v=off ;; *) die "$key is on or off" ;;
+      esac ;;
+    int)
+      case "$v" in ''|*[!0-9]*) die "$key needs a whole number" ;; esac
+      v=$((10#$v))
+      case "$key" in
+        dpi) [ "$v" -ge 72 ] && [ "$v" -le 480 ] || die "dpi goes from 72 to 480" ;;
+        cpu_cores) [ "$v" -le 256 ] || die "cpu_cores goes from 0 (all) to 256" ;;
+      esac ;;
+    choice)
+      [ "$key" = windows_version ] && [ "$v" = winxp ] && v=winxp64
+      choices=" $(setting_field "$key" 4) "
+      case "$choices" in *" $v "*) ;; *) die "$key is one of:$(printf '%s' "$choices" | sed 's/ $//')" ;; esac ;;
+    text)
+      case "$key" in
+        virtual_desktop)
+          v=$(printf '%s' "$v" | tr '[:upper:]' '[:lower:]')
+          case "$v" in off|no|0) v=off ;; *) printf '%s' "$v" | grep -qE '^[1-9][0-9]{2,4}x[1-9][0-9]{2,4}$' || die "virtual_desktop is off or a size like 1920x1080" ;; esac ;;
+        env)
+          local e saved_ifs="$IFS"; IFS=';'
+          for e in $v; do
+            [ -z "$e" ] && continue
+            printf '%s' "$e" | grep -qE '^[A-Za-z_][A-Za-z0-9_]*=' || { IFS="$saved_ifs"; die "env entries look like NAME=value, separated by ;"; }
+          done
+          IFS="$saved_ifs" ;;
+      esac ;;
+  esac
+  printf '%s' "$v"
+}
+
+conf_unset() { # file key
+  [ -f "$1" ] || return 0
+  local tmp="$1.tmp.$$"
+  grep -v "^$2=" "$1" > "$tmp"; mv "$tmp" "$1"
+}
+
+# A setting's raw value in one place, or nothing. Reads the keys older versions wrote too.
+setting_raw() { # conf-file key
+  local v
+  v=$(conf_get "$1" "$2" 2>/dev/null) || v=""
+  if [ -z "$v" ]; then
+    case "$2" in
+      graphics) [ "$(conf_get "$1" engine 2>/dev/null)" = "$STOCK_ENGINE" ] && v=compat ;;
+      dll_overrides) v=$(conf_get "$1" dlloverrides 2>/dev/null) || v="" ;;
+    esac
+  fi
+  # An app saying "auto" graphics means "whatever its bottle uses".
+  case "$1" in *.app.conf) [ "$2" = graphics ] && [ "$v" = auto ] && v="" ;; esac
+  printf '%s' "$v"
+}
+
+# The value that applies, and where it came from: prints "value<TAB>app|bottle|default".
+setting_resolve() { # bottle app-id key
+  local scope v; scope=$(setting_field "$3" 1)
+  if [ -n "$2" ] && [ "$scope" != bottle ]; then
+    v=$(setting_raw "$(lib_file "$2")" "$3")
+    [ -n "$v" ] && { printf '%s\tapp' "$v"; return; }
+  fi
+  if [ "$scope" != app ]; then
+    v=$(setting_raw "$(bottle_conf "$1")" "$3")
+    [ -n "$v" ] && { printf '%s\tbottle' "$v"; return; }
+  fi
+  printf '%s\tdefault' "$(setting_default "$3")"
+}
+setting_get() { setting_resolve "$@" | cut -f1; }
+
+# Presets set every bottle setting except dll_overrides and env; the rest go back to defaults.
+PRESETS="gaming apps legacy retro desktop"
+preset_meta() { # name -> "description|settings"
+  case "$1" in
+    gaming)  echo "Steam and modern 3D games: turbo graphics, Windows 10.|graphics=auto windows_version=win10" ;;
+    apps)    echo "Office, creative and other desktop apps: sharp Retina text, Cmd-C/Cmd-V as Ctrl.|retina=on dpi=192 command_as_ctrl=on windows_version=win10" ;;
+    legacy)  echo "Games and programs from the Windows 7 era: OpenGL graphics, Windows 7, 8 cores.|graphics=compat windows_version=win7 cpu_cores=8" ;;
+    retro)   echo "Windows XP-era games: Windows XP, OpenGL, 2 cores, in an 1024x768 desktop window.|graphics=compat windows_version=winxp64 cpu_cores=2 virtual_desktop=1024x768" ;;
+    desktop) echo "A whole Windows desktop in one Mac window, like a lightweight VM.|virtual_desktop=1600x1000 command_as_ctrl=on windows_version=win10" ;;
+    *) return 1 ;;
+  esac
+}
+
+apply_preset() { # bottle preset
+  local conf meta key pair; conf=$(bottle_conf "$1")
+  meta=$(preset_meta "$2") || die "unknown preset '$2' (one of: $PRESETS)"
+  for key in $SETTING_KEYS; do
+    case "$key" in dll_overrides|env|args) continue ;; esac
+    conf_unset "$conf" "$key"
+  done
+  conf_unset "$conf" engine
+  for pair in ${meta#*|}; do conf_set "$conf" "${pair%%=*}" "${pair#*=}"; done
+  conf_set "$conf" preset "$2"
+}
+
 # --- Bottles (one Windows install each) ------------------------------------------------------
 bottle_dir()    { printf '%s/%s' "$BOTTLES" "$1"; }
 bottle_prefix() { printf '%s/%s/prefix' "$BOTTLES" "$1"; }
 bottle_conf()   { printf '%s/%s/bottle.conf' "$BOTTLES" "$1"; }
 bottle_exists() { [ -d "$(bottle_prefix "$1")/drive_c" ]; }
 
-bottle_engine() { # bottle -> engine it should run on now
-  local e; e=$(conf_get "$(bottle_conf "$1")" engine 2>/dev/null) || e=auto
-  if [ "$e" = auto ]; then best_engine; else echo "$e"; fi
+graphics_engine() { # graphics-setting -> engine
+  case "$1" in
+    turbo|dxmt) engine_ok "$TURBO_ENGINE" || die "turbo graphics isn't built yet; run: burrow turbo"; echo "$TURBO_ENGINE" ;;
+    compat|wined3d) echo "$STOCK_ENGINE" ;;
+    auto|"") best_engine ;;
+    *) die "unknown graphics mode '$1' (use auto, turbo or compat)" ;;
+  esac
+}
+bottle_engine() { graphics_engine "$(setting_get "$1" "" graphics)"; }
+
+# Just enough to talk to a bottle's wineserver (stopping it, deleting the bottle).
+bottle_env() { # bottle
+  WINE=$(engine_wine "$(bottle_engine "$1")") || WINE=$(engine_wine "$STOCK_ENGINE") || return 1
+  WINESERVER=$(engine_wineserver "$(bottle_engine "$1")")
+  export WINEPREFIX; WINEPREFIX=$(bottle_prefix "$1")
 }
 
-# Exports the environment for running Wine in a bottle. Sets WINE and WINESERVER.
-use_bottle() { # bottle [graphics]
-  local bottle="$1" graphics="${2:-auto}" engine
-  engine=$(bottle_engine "$bottle")
-  case "$graphics" in
-    turbo|dxmt) engine_ok "$TURBO_ENGINE" || die "turbo graphics isn't built yet; run: burrow turbo"; engine="$TURBO_ENGINE" ;;
-    compat|wined3d) engine="$STOCK_ENGINE" ;;
-    auto|"") ;;
-    *) die "unknown graphics mode '$graphics' (use auto, turbo or compat)" ;;
-  esac
+# The registry side of a bottle's settings, as a .reg file Wine imports in one go.
+reg_yn() { if [ "$(setting_get "$1" "" "$2")" = on ]; then echo y; else echo n; fi; } # bottle key
+bottle_registry() { # bottle
+  local b="$1" desk dpi
+  desk=$(setting_get "$b" "" virtual_desktop)
+  dpi=$(setting_get "$b" "" dpi)
+  printf 'Windows Registry Editor Version 5.00\r\n\r\n'
+  printf '[HKEY_CURRENT_USER\\Software\\Wine]\r\n"Version"="%s"\r\n\r\n' "$(setting_get "$b" "" windows_version)"
+  printf '[HKEY_CURRENT_USER\\Software\\Wine\\Mac Driver]\r\n'
+  printf '"LeftOptionIsAlt"="%s"\r\n"RightOptionIsAlt"="%s"\r\n' "$(reg_yn "$b" option_as_alt)" "$(reg_yn "$b" option_as_alt)"
+  printf '"LeftCommandIsCtrl"="%s"\r\n"RightCommandIsCtrl"="%s"\r\n' "$(reg_yn "$b" command_as_ctrl)" "$(reg_yn "$b" command_as_ctrl)"
+  printf '"RetinaMode"="%s"\r\n"CaptureDisplaysForFullscreen"="%s"\r\n\r\n' "$(reg_yn "$b" retina)" "$(reg_yn "$b" fullscreen_capture)"
+  # winecfg's DPI lives under the current hardware profile; older Wine read the user key.
+  printf '[HKEY_LOCAL_MACHINE\\System\\CurrentControlSet\\Hardware Profiles\\Current\\Software\\Fonts]\r\n"LogPixels"=dword:%08x\r\n\r\n' "$dpi"
+  printf '[HKEY_CURRENT_USER\\Control Panel\\Desktop]\r\n"LogPixels"=dword:%08x\r\n\r\n' "$dpi"
+  if [ "$desk" = off ]; then
+    printf '[HKEY_CURRENT_USER\\Software\\Wine\\Explorer]\r\n"Desktop"=-\r\n\r\n'
+  else
+    printf '[HKEY_CURRENT_USER\\Software\\Wine\\Explorer]\r\n"Desktop"="Burrow"\r\n\r\n'
+    printf '[HKEY_CURRENT_USER\\Software\\Wine\\Explorer\\Desktops]\r\n"Burrow"="%s"\r\n\r\n' "$desk"
+  fi
+}
+
+# Imports the registry settings when they changed since the last import.
+apply_bottle_registry() { # bottle (WINE, WINESERVER and WINEPREFIX already set)
+  local conf want have reg
+  conf=$(bottle_conf "$1")
+  want=$(bottle_registry "$1" | cksum | awk '{print $1}')
+  have=$(conf_get "$conf" reg_applied 2>/dev/null) || have=""
+  [ "$want" = "$have" ] && return 0
+  [ -d "$WINEPREFIX/drive_c" ] || return 0
+  reg="$WINEPREFIX/drive_c/burrow-settings.reg"
+  bottle_registry "$1" > "$reg"
+  "$WINE" reg import 'C:\burrow-settings.reg' >/dev/null 2>&1 || warn "Wine couldn't apply some settings to '$1'"
+  "$WINESERVER" -w 2>/dev/null
+  rm -f "$reg"
+  conf_set "$conf" reg_applied "$want"
+}
+
+# Exports the environment for running Wine in a bottle (and optionally as one library app).
+# Sets WINE, WINESERVER and BOTTLE_ENGINE.
+use_bottle() { # bottle [graphics] [app-id]
+  local bottle="$1" graphics="${2:-}" app="${3:-}" engine
+  [ -n "$graphics" ] && [ "$graphics" != auto ] || graphics=$(setting_get "$bottle" "$app" graphics)
+  engine=$(graphics_engine "$graphics") || exit 1
   WINE=$(engine_wine "$engine") || die "Wine isn't set up yet; run: burrow setup"
   WINESERVER=$(engine_wineserver "$engine")
   export WINEPREFIX; WINEPREFIX=$(bottle_prefix "$bottle")
-  export WINEDEBUG="${BURROW_WINEDEBUG:--all}"
-  export WINEMSYNC=1                 # Mach-semaphore sync; builds without it ignore this
+
+  local dbg; dbg=$(setting_get "$bottle" "$app" wine_debug)
+  case "$dbg" in errors) dbg="-all,err+all" ;; verbose) dbg="err+all,warn+all,fixme-all" ;; *) dbg="-all" ;; esac
+  export WINEDEBUG="${BURROW_WINEDEBUG:-$dbg}"
+  if [ "$(setting_get "$bottle" "$app" msync)" = on ]; then export WINEMSYNC=1; else export WINEMSYNC=0; fi
   export MVK_CONFIG_LOG_LEVEL=1      # MoltenVK: errors only
-  [ "${BURROW_HUD:-0}" = 1 ] && export MTL_HUD_ENABLED=1
+  unset MTL_HUD_ENABLED WINE_CPU_TOPOLOGY
+  { [ "${BURROW_HUD:-0}" = 1 ] || [ "$(setting_get "$bottle" "$app" hud)" = on ]; } && export MTL_HUD_ENABLED=1
+  local cores; cores=$(setting_get "$bottle" "$app" cpu_cores)
+  if [ "${cores:-0}" -gt 0 ]; then
+    local i=1 list=0
+    while [ "$i" -lt "$cores" ]; do list="$list,$i"; i=$((i + 1)); done
+    export WINE_CPU_TOPOLOGY="$cores:$list"
+  fi
+
   # Stock Wine draws D3D11 with its own OpenGL path; force builtin so DLLs a game or
   # installer dropped into the bottle can't take over. Turbo's builtins are DXMT.
-  local overrides="d3d11,dxgi,d3d10core=b"
+  local overrides="d3d11,dxgi,d3d10core=b" more
   [ "$engine" = "$TURBO_ENGINE" ] && overrides="$overrides;winemetal=b"
-  local extra; extra=$(conf_get "$(bottle_conf "$bottle")" dlloverrides 2>/dev/null) || extra=""
-  export WINEDLLOVERRIDES="$overrides${extra:+;$extra}"
+  more=$(setting_raw "$(bottle_conf "$bottle")" dll_overrides)
+  [ -n "$more" ] && overrides="$overrides;$more"
+  if [ -n "$app" ]; then more=$(setting_raw "$(lib_file "$app")" dll_overrides); [ -n "$more" ] && overrides="$overrides;$more"; fi
+  export WINEDLLOVERRIDES="$overrides"
+
+  # Extra environment: the bottle's, then the app's (later entries win).
+  BURROW_USER_ENV=""
+  local e envs saved_ifs="$IFS"
+  envs=$(setting_raw "$(bottle_conf "$bottle")" env)
+  [ -n "$app" ] && envs="$envs;$(setting_raw "$(lib_file "$app")" env)"
+  IFS=';'
+  for e in $envs; do
+    case "$e" in [A-Za-z_]*=*) export "${e?}"; BURROW_USER_ENV="$BURROW_USER_ENV ${e%%=*}" ;; esac
+  done
+  IFS="$saved_ifs"
+
   if [ -d /Library/Frameworks/GStreamer.framework/Libraries ] && is_mac; then
     # In-game videos (Unity/Unreal intros) play through Wine's GStreamer bridge.
     export GST_PLUGIN_SYSTEM_PATH_1_0=/Library/Frameworks/GStreamer.framework/Libraries/gstreamer-1.0
@@ -152,6 +356,7 @@ use_bottle() { # bottle [graphics]
     "$WINESERVER" -w 2>/dev/null
     conf_set "$conf" last_engine "$engine"
   fi
+  apply_bottle_registry "$bottle"
   BOTTLE_ENGINE="$engine"
 }
 
@@ -162,39 +367,58 @@ new_log() { # name -> log path (keeps the newest 20 per name)
   printf '%s/%s-%s.log' "$LOGS" "$base" "$(date +%Y%m%d-%H%M%S)"
 }
 
-cmd_bottle_create() { # name
-  local name="$1" dir
+cmd_bottle_create() { # name [preset]
+  local name="$1" preset="${2:-}" dir
   [ -n "$name" ] || die "give the bottle a name"
-  case "$name" in */*|.*) die "bottle names can't contain / or start with ." ;; esac
+  case "$name" in */*|.*|*"	"*) die "bottle names can't contain / or tabs, or start with ." ;; esac
+  [ -z "$preset" ] || preset_meta "$preset" >/dev/null || die "unknown preset '$preset' (one of: $PRESETS)"
   dir=$(bottle_dir "$name")
-  if bottle_exists "$name"; then ok "Bottle '$name' already exists"; return 0; fi
+  if bottle_exists "$name"; then
+    [ -n "$preset" ] && { apply_preset "$name" "$preset"; settings_apply_now "$name"; ok "Bottle '$name' now uses the $preset preset"; return 0; }
+    ok "Bottle '$name' already exists"; return 0
+  fi
   mkdir -p "$dir"
-  [ -f "$(bottle_conf "$name")" ] || printf 'engine=auto\n' > "$(bottle_conf "$name")"
+  touch "$(bottle_conf "$name")"
+  [ -n "$preset" ] && apply_preset "$name" "$preset"
+  step "Creating bottle '$name' (a fresh Windows folder)…"
   use_bottle "$name"
-  step "Creating bottle '$name' (a fresh Windows 10 folder)…"
   "$WINE" wineboot -i >/dev/null 2>&1
   "$WINESERVER" -w 2>/dev/null
   [ -d "$WINEPREFIX/drive_c" ] || die "Wine couldn't create the bottle; try: BURROW_WINEDEBUG=err+all burrow bottle new '$name'"
-  "$WINE" reg add 'HKCU\Software\Wine' /v Version /t REG_SZ /d win10 /f >/dev/null 2>&1
-  # Keep macOS shortcuts like Cmd-Q and Cmd-H working, and let Option act as Alt for games.
-  "$WINE" reg add 'HKCU\Software\Wine\Mac Driver' /v LeftOptionIsAlt /t REG_SZ /d y /f >/dev/null 2>&1
-  "$WINE" reg add 'HKCU\Software\Wine\Mac Driver' /v RightOptionIsAlt /t REG_SZ /d y /f >/dev/null 2>&1
-  "$WINESERVER" -w 2>/dev/null
+  apply_bottle_registry "$name"
   conf_set "$(bottle_conf "$name")" last_engine "$BOTTLE_ENGINE"
-  ok "Bottle '$name' is ready"
+  ok "Bottle '$name' is ready${preset:+ ($preset preset)}"
 }
+
+# Stops everything running in a bottle.
+stop_bottle() { ( bottle_env "$1" && "$WINESERVER" -k ) >/dev/null 2>&1; return 0; }
+
+# True when Wine programs are running in the bottle.
+bottle_busy() { running_procs | cut -f1 | grep -qxF "$1"; }
 
 cmd_bottle() {
   local sub="${1:-list}"; shift || true
   case "$sub" in
-    new|create) cmd_bottle_create "${1:-}" ;;
+    new|create)
+      local name="" preset=""
+      while [ $# -gt 0 ]; do
+        case "$1" in --preset) preset="${2:-}"; shift 2 ;; *) name="$1"; shift ;; esac
+      done
+      cmd_bottle_create "$name" "$preset" ;;
     list|ls)
-      [ -d "$BOTTLES" ] || { say "No bottles yet."; return 0; }
-      local d n
+      local d n plain=0; [ "${1:-}" = --plain ] && plain=1
+      [ -d "$BOTTLES" ] || { [ "$plain" = 1 ] || say "No bottles yet."; return 0; }
       for d in "$BOTTLES"/*/; do
         [ -d "$d" ] || continue
         n=$(basename "$d")
-        printf '%-20s engine: %s\n' "$n" "$(bottle_engine "$n")"
+        if [ "$plain" = 1 ]; then
+          # For Burrow.app: name, graphics, windows version, preset, virtual desktop.
+          printf '%s\t%s\t%s\t%s\t%s\n' "$n" "$(setting_get "$n" "" graphics)" "$(setting_get "$n" "" windows_version)" \
+            "$(conf_get "$(bottle_conf "$n")" preset 2>/dev/null)" "$(setting_get "$n" "" virtual_desktop)"
+        else
+          printf '%-20s %-7s %-8s %s\n' "$n" "$(setting_get "$n" "" graphics)" "$(setting_get "$n" "" windows_version)" \
+            "$(conf_get "$(bottle_conf "$n")" preset 2>/dev/null)"
+        fi
       done ;;
     delete|rm)
       local name="${1:-}"; [ -n "$name" ] || die "which bottle?"
@@ -203,15 +427,287 @@ cmd_bottle() {
         printf 'Delete bottle %s and everything installed in it? Type its name to confirm: ' "$name"
         local answer; read -r answer; [ "$answer" = "$name" ] || die "not deleted"
       fi
-      ( use_bottle "$name" && "$WINESERVER" -k ) >/dev/null 2>&1
-      rm -rf "$(bottle_dir "$name")"
+      stop_bottle "$name"
+      rm -rf "${BOTTLES:?}/${name:?}" "${SNAPSHOTS:?}/${name:?}"
       grep -lxF "bottle=$name" "$LIBRARY"/*.app.conf 2>/dev/null | while IFS= read -r f; do rm -f "$f"; done
       ok "Deleted bottle '$name'" ;;
+    clone|copy|duplicate)
+      local src="${1:-}" dst="${2:-}"
+      bottle_exists "$src" || die "no bottle named '$src'"
+      [ -n "$dst" ] || die "usage: burrow bottle clone <bottle> <new name>"
+      case "$dst" in */*|.*) die "bottle names can't contain / or start with ." ;; esac
+      [ -e "$(bottle_dir "$dst")" ] && die "there's already a bottle named '$dst'"
+      bottle_busy "$src" && die "quit the programs running in '$src' first (burrow kill '$src')"
+      step "Copying bottle '$src' to '$dst'…"
+      clone_tree "$(bottle_dir "$src")" "$(bottle_dir "$dst")" || die "couldn't copy the bottle"
+      ok "Made bottle '$dst' (programs in it aren't in your library; add them with burrow add)" ;;
     engine)
       local name="${1:-}" e="${2:-}"; bottle_exists "$name" || die "no bottle named '$name'"
-      case "$e" in auto|turbo) e=auto ;; compat|stock) e="$STOCK_ENGINE" ;; *) die "use: burrow bottle engine <bottle> auto|compat" ;; esac
-      conf_set "$(bottle_conf "$name")" engine "$e"; ok "Bottle '$name' now uses: $e" ;;
-    *) die "unknown: burrow bottle $sub (new, list, delete, engine)" ;;
+      case "$e" in auto|turbo) e=auto ;; compat|stock) e=compat ;; *) die "use: burrow bottle engine <bottle> auto|compat" ;; esac
+      cmd_settings "$name" graphics "$e" ;;
+    *) die "unknown: burrow bottle $sub (new, list, clone, delete, engine)" ;;
+  esac
+}
+
+# burrow settings <bottle> | --app <app>  [--plain] [key | key value | key=value… | preset NAME]
+cmd_settings() {
+  local bottle="" app="" plain=0 rest=()
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --app) app="${2:-}"; shift 2 ;;
+      --plain) plain=1; shift ;;
+      --list) settings_list; return 0 ;;
+      *) rest+=("$1"); shift ;;
+    esac
+  done
+  local conf
+  if [ -n "$app" ]; then
+    app=$(lib_find "$app") || die "no app called '$app' (see: burrow apps)"
+    conf=$(lib_file "$app"); bottle=$(conf_get "$conf" bottle)
+  else
+    [ ${#rest[@]} -gt 0 ] || die "usage: burrow settings <bottle> [key [value]]  or  burrow settings --app <app> …"
+    bottle="${rest[0]}"
+    if [ ${#rest[@]} -gt 1 ]; then rest=("${rest[@]:1}"); else rest=(); fi
+    bottle_exists "$bottle" || die "no bottle named '$bottle' (see: burrow bottle list)"
+    conf=$(bottle_conf "$bottle")
+  fi
+
+  # Show everything.
+  if [ ${#rest[@]} -eq 0 ]; then settings_show "$bottle" "$app" "$plain"; return 0; fi
+
+  # A preset (bottles only).
+  if [ "${rest[0]}" = preset ]; then
+    [ -z "$app" ] || die "presets are for bottles; the app follows its bottle"
+    apply_preset "$bottle" "${rest[1]:-}"
+    settings_apply_now "$bottle"
+    ok "Bottle '$bottle' now uses the ${rest[1]} preset"; return 0
+  fi
+
+  # One value.
+  if [ ${#rest[@]} -eq 1 ] && [ "${rest[0]#*=}" = "${rest[0]}" ]; then
+    setting_meta "${rest[0]}" >/dev/null || die "unknown setting '${rest[0]}' (see: burrow settings --list)"
+    setting_get "$bottle" "$app" "${rest[0]}"; echo; return 0
+  fi
+
+  # Set: "key value" or any number of key=value.
+  local pairs=() p key val
+  if [ ${#rest[@]} -eq 2 ] && [ "${rest[0]#*=}" = "${rest[0]}" ]; then pairs=("${rest[0]}=${rest[1]}")
+  else pairs=("${rest[@]}"); fi
+  # Check everything before changing anything.
+  for p in "${pairs[@]}"; do
+    case "$p" in *=*) ;; *) die "use key=value (got '$p')" ;; esac
+    key="${p%%=*}"
+    setting_meta "$key" >/dev/null || die "unknown setting '$key' (see: burrow settings --list)"
+    case "$(setting_field "$key" 1)" in
+      bottle) [ -z "$app" ] || die "$key applies to the whole bottle; set it with: burrow settings '$bottle' $key …" ;;
+      app) [ -n "$app" ] || die "$key is set per app: burrow settings --app <app> $key …" ;;
+    esac
+    setting_normalize "$key" "${p#*=}" >/dev/null || exit 1
+  done
+  for p in "${pairs[@]}"; do
+    key="${p%%=*}"; val=$(setting_normalize "$key" "${p#*=}")
+    if [ -z "$val" ]; then conf_unset "$conf" "$key"; else conf_set "$conf" "$key" "$val"; fi
+    [ "$key" = graphics ] && conf_unset "$conf" engine
+    [ "$key" = dll_overrides ] && conf_unset "$conf" dlloverrides
+    ok "$key = $(setting_get "$bottle" "$app" "$key")${app:+ (for $(conf_get "$conf" name))}"
+  done
+  [ -z "$app" ] && conf_unset "$conf" preset
+  [ -z "$app" ] && settings_apply_now "$bottle"
+  return 0
+}
+
+# Registry settings go into the bottle straight away when Wine is installed; otherwise on
+# the next start.
+settings_apply_now() { # bottle
+  local e; e=$(bottle_engine "$1" 2>/dev/null) || return 0
+  engine_ok "$e" || return 0
+  ( use_bottle "$1" ) >/dev/null 2>&1 || warn "settings saved; they apply the next time '$1' starts"
+}
+
+settings_show() { # bottle app plain
+  local key scope res src
+  for key in $SETTING_KEYS; do
+    scope=$(setting_field "$key" 1)
+    if [ -n "$2" ]; then [ "$scope" = bottle ] && continue; else [ "$scope" = app ] && continue; fi
+    res=$(setting_resolve "$1" "$2" "$key")
+    if [ "$3" = 1 ]; then
+      # key, value, source, type, choices, default, scope, description
+      printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$key" "${res%	*}" "${res##*	}" "$(setting_field "$key" 2)" \
+        "$(setting_field "$key" 4)" "$(setting_default "$key")" "$scope" "$(setting_field "$key" 5)"
+    else
+      src="${res##*	}"; if [ "$src" = default ]; then src="${D}default${N}"; else src="${B}$src${N}"; fi
+      printf '  %-20s %-24s %s\n' "$key" "${res%	*}" "$src"
+    fi
+  done
+  if [ "$3" != 1 ] && [ -z "$2" ]; then
+    local preset; preset=$(conf_get "$(bottle_conf "$1")" preset 2>/dev/null) && say "  ${D}preset: $preset${N}"
+  fi
+  return 0
+}
+
+settings_list() {
+  local key
+  say "${B}Settings${N} (burrow settings <bottle> key value, or --app <app> for one program)"
+  for key in $SETTING_KEYS; do
+    printf '\n  %s%s%s  [%s; default: %s]\n' "$B" "$key" "$N" "$(setting_field "$key" 1 | sed 's/both/bottle or app/')" "$(setting_default "$key" | sed 's/^$/none/')"
+    [ -n "$(setting_field "$key" 4)" ] && printf '    one of: %s\n' "$(setting_field "$key" 4)"
+    printf '    %s\n' "$(setting_field "$key" 5)"
+  done
+  say ""; say "Set a value to 'default' to clear it. Presets: burrow presets"
+}
+
+cmd_presets() {
+  local p meta
+  for p in $PRESETS; do
+    meta=$(preset_meta "$p")
+    if [ "${1:-}" = --plain ]; then printf '%s\t%s\t%s\n' "$p" "${meta%%|*}" "${meta#*|}"
+    else printf '  %s%-8s%s %s\n           %s%s%s\n' "$B" "$p" "$N" "${meta%%|*}" "$D" "${meta#*|}" "$N"; fi
+  done
+}
+
+# --- Snapshots: save a bottle and roll back to it ------------------------------------------------
+# On a Mac each snapshot is an APFS clone, so it takes seconds and almost no space until the
+# bottle changes.
+snapshot_dir() { printf '%s/%s/%s' "$SNAPSHOTS" "$1" "$2"; }
+
+cmd_snapshot() {
+  local sub="${1:-}" bottle="${2:-}"; shift 2 2>/dev/null || shift $#
+  [ -n "$bottle" ] || die "usage: burrow snapshot save|list|restore|delete <bottle> …"
+  bottle_exists "$bottle" || die "no bottle named '$bottle'"
+  case "$sub" in
+    save|take|new)
+      local label="${1:-}" force="${2:-}"
+      [ "$label" = --force ] && { force=--force; label=""; }
+      if bottle_busy "$bottle"; then
+        [ "$force" = --force ] || die "programs are running in '$bottle'; quit them first (or add --force to stop them)"
+        stop_bottle "$bottle"
+      fi
+      local id dir n=2; id=$(date +%Y%m%d-%H%M%S); dir=$(snapshot_dir "$bottle" "$id")
+      while [ -e "$dir" ]; do dir=$(snapshot_dir "$bottle" "$id-$n"); n=$((n + 1)); done
+      id=$(basename "$dir")
+      mkdir -p "$dir"
+      step "Saving a snapshot of '$bottle'…"
+      clone_tree "$(bottle_prefix "$bottle")" "$dir/prefix" || { rm -rf "${dir:?}"; die "couldn't copy the bottle"; }
+      cp "$(bottle_conf "$bottle")" "$dir/bottle.conf" 2>/dev/null
+      { printf 'label=%s\n' "${label:-Snapshot}"; printf 'created=%s\n' "$(date '+%Y-%m-%d %H:%M')"; } > "$dir/snapshot.conf"
+      ok "Saved snapshot $id${label:+ ($label)}" ;;
+    list|ls)
+      local d any=0
+      for d in "$SNAPSHOTS/$bottle"/*/; do
+        [ -f "$d/snapshot.conf" ] || continue; any=1
+        if [ "${1:-}" = --plain ]; then
+          printf '%s\t%s\t%s\n' "$(basename "$d")" "$(conf_get "$d/snapshot.conf" label)" "$(conf_get "$d/snapshot.conf" created)"
+        else
+          printf '  %-18s %-17s %s\n' "$(basename "$d")" "$(conf_get "$d/snapshot.conf" created)" "$(conf_get "$d/snapshot.conf" label)"
+        fi
+      done
+      [ "$any" = 1 ] || [ "${1:-}" = --plain ] || say "No snapshots of '$bottle' yet. Make one with: burrow snapshot save '$bottle' \"label\"" ;;
+    restore)
+      local id="${1:-}" dir prefix; [ -n "$id" ] || die "which snapshot? (see: burrow snapshot list '$bottle')"
+      case "$id" in */*|.*) die "no snapshot '$id' for '$bottle'" ;; esac
+      dir=$(snapshot_dir "$bottle" "$id"); [ -d "$dir/prefix/drive_c" ] || die "no snapshot '$id' for '$bottle'"
+      stop_bottle "$bottle"
+      prefix=$(bottle_prefix "$bottle")
+      step "Rolling '$bottle' back to $id…"
+      mv "$prefix" "$prefix.old.$$" || die "couldn't move the bottle aside"
+      if ! clone_tree "$dir/prefix" "$prefix"; then rm -rf "${prefix:?}"; mv "$prefix.old.$$" "$prefix"; die "couldn't restore the snapshot"; fi
+      rm -rf "${prefix:?}.old.$$"
+      [ -f "$dir/bottle.conf" ] && cp "$dir/bottle.conf" "$(bottle_conf "$bottle")"
+      ok "'$bottle' is back to $id ($(conf_get "$dir/snapshot.conf" label))" ;;
+    delete|rm)
+      local id="${1:-}"; [ -n "$id" ] || die "which snapshot?"
+      case "$id" in */*|.*) die "no snapshot '$id' for '$bottle'" ;; esac
+      [ -d "$(snapshot_dir "$bottle" "$id")" ] || die "no snapshot '$id' for '$bottle'"
+      rm -rf "${SNAPSHOTS:?}/${bottle:?}/${id:?}"; ok "Deleted snapshot $id" ;;
+    *) die "unknown: burrow snapshot $sub (save, list, restore, delete)" ;;
+  esac
+}
+
+# --- Windows desktop: the bottle as one window, like a VM ---------------------------------------
+cmd_desktop() { # bottle [size]
+  local bottle="${1:-}" size="${2:-}"
+  [ -n "$bottle" ] || die "usage: burrow desktop <bottle> [1600x1000]"
+  bottle_exists "$bottle" || die "no bottle named '$bottle'"
+  [ -n "$size" ] || size=$(setting_get "$bottle" "" virtual_desktop)
+  [ "$size" = off ] && size=1600x1000
+  size=$(setting_normalize virtual_desktop "$size") || exit 1
+  use_bottle "$bottle"
+  local log; log=$(new_log "desktop-$bottle")
+  step "Opening the Windows desktop of '$bottle' ($size)…  log: $log"
+  # Named like the desktop the virtual_desktop setting uses, so programs started from the
+  # library while it's open land in the same window.
+  "$WINE" explorer "/desktop=Burrow,$size" explorer.exe 'C:\' >>"$log" 2>&1 &
+  [ "${BURROW_FOREGROUND:-0}" = 1 ] && wait
+  return 0
+}
+
+# --- Windows components (Visual C++, .NET, fonts…) through winetricks ------------------------------
+WINETRICKS_VERSION="${BURROW_WINETRICKS_VERSION:-20240105}"
+WINETRICKS_URL="${BURROW_WINETRICKS_URL:-https://raw.githubusercontent.com/Winetricks/winetricks/$WINETRICKS_VERSION/src/winetricks}"
+COMPONENTS="vcrun2022 vcrun2013 vcrun2010 vcrun2008 dotnet48 d3dx9 d3dcompiler_47 xact physx corefonts cjkfonts"
+component_meta() {
+  case "$1" in
+    vcrun2022) echo "Visual C++ 2015-2022 runtime (most modern programs and games)" ;;
+    vcrun2013) echo "Visual C++ 2013 runtime" ;;
+    vcrun2010) echo "Visual C++ 2010 runtime" ;;
+    vcrun2008) echo "Visual C++ 2008 runtime (older games)" ;;
+    dotnet48)  echo ".NET Framework 4.8 (many tools and launchers; slow to install)" ;;
+    d3dx9)     echo "DirectX 9 helper libraries (older games)" ;;
+    d3dcompiler_47) echo "Direct3D shader compiler" ;;
+    xact)      echo "XACT audio (games with missing sound)" ;;
+    physx)     echo "NVIDIA PhysX runtime" ;;
+    corefonts) echo "Microsoft core fonts (Arial, Times New Roman…)" ;;
+    cjkfonts)  echo "Chinese, Japanese and Korean fonts" ;;
+    *) return 1 ;;
+  esac
+}
+
+winetricks_path() {
+  if [ -n "${BURROW_WINETRICKS:-}" ]; then printf '%s' "$BURROW_WINETRICKS"; return; fi
+  local wt="$RUNTIMES/winetricks-$WINETRICKS_VERSION"
+  if [ ! -x "$wt" ]; then
+    step "Downloading winetricks $WINETRICKS_VERSION (installs Windows components)…" >&2
+    download "$WINETRICKS_URL" "$wt" >&2 || die "couldn't download winetricks"
+    chmod +x "$wt"
+  fi
+  printf '%s' "$wt"
+}
+
+cmd_components() { # bottle [list [--plain] | install verb…]
+  local bottle="${1:-}" sub="${2:-list}"; shift 2 2>/dev/null || shift $#
+  [ -n "$bottle" ] || die "usage: burrow components <bottle> [list | install vcrun2022 corefonts …]"
+  bottle_exists "$bottle" || die "no bottle named '$bottle'"
+  local log v have; log="$(bottle_prefix "$bottle")/winetricks.log"
+  case "$sub" in
+    list|ls)
+      for v in $COMPONENTS; do
+        have=0; grep -qx "$v" "$log" 2>/dev/null && have=1
+        if [ "${1:-}" = --plain ]; then printf '%s\t%s\t%s\n' "$v" "$have" "$(component_meta "$v")"
+        elif [ "$have" = 1 ]; then printf '  %s✓%s %-16s %s\n' "$G" "$N" "$v" "$(component_meta "$v")"
+        else printf '    %-16s %s\n' "$v" "$(component_meta "$v")"; fi
+      done
+      [ "${1:-}" = --plain ] || say "  ${D}Any other winetricks name works too: burrow components '$bottle' install <name>${N}" ;;
+    install|add)
+      [ $# -gt 0 ] || die "which components? (see: burrow components '$bottle')"
+      for v in "$@"; do case "$v" in -*|*[!A-Za-z0-9_.=-]*) die "'$v' isn't a component name" ;; esac; done
+      if is_mac && ! command -v cabextract >/dev/null 2>&1; then
+        local brew="" b
+        for b in /opt/homebrew/bin/brew /usr/local/bin/brew; do [ -x "$b" ] && brew="$b" && break; done
+        [ -n "$brew" ] || die "Windows components need cabextract from Homebrew; install Homebrew (Setup tab) first"
+        step "Installing cabextract with Homebrew…"; "$brew" install cabextract || die "Homebrew couldn't install cabextract"
+        PATH="$("$brew" --prefix)/bin:$PATH"; export PATH
+      fi
+      local wt; wt=$(winetricks_path) || exit 1
+      use_bottle "$bottle"
+      local runlog; runlog=$(new_log "components-$bottle")
+      step "Installing into '$bottle': $*  (this can take a while; log: $runlog)"
+      WINETRICKS_LATEST_VERSION_CHECK=disabled WINE="$WINE" WINESERVER="$WINESERVER" \
+        "$wt" --unattended "$@" 2>&1 | tee -a "$runlog"
+      local rc=${PIPESTATUS[0]}
+      "$WINESERVER" -w 2>/dev/null
+      [ "$rc" = 0 ] || die "winetricks stopped with an error; see $runlog"
+      ok "Installed: $*" ;;
+    *) die "unknown: burrow components <bottle> $sub (list, install)" ;;
   esac
 }
 
@@ -465,16 +961,17 @@ win_path() { # prefix unix-path
   printf 'C:\\%s' "$(printf '%s' "$rel" | tr '/' '\\')"
 }
 
-cmd_install() { # installer [--bottle B] [--name N]
-  local installer="" bottle="" name=""
+cmd_install() { # installer [--bottle B] [--name N] [--preset P]
+  local installer="" bottle="" name="" preset=""
   while [ $# -gt 0 ]; do
     case "$1" in
       --bottle) bottle="${2:-}"; shift 2 ;;
       --name) name="${2:-}"; shift 2 ;;
+      --preset) preset="${2:-}"; shift 2 ;;
       *) installer="$1"; shift ;;
     esac
   done
-  [ -n "$installer" ] || die "usage: burrow install <setup.exe or .msi> [--bottle NAME] [--name NAME]"
+  [ -n "$installer" ] || die "usage: burrow install <setup.exe or .msi> [--bottle NAME] [--name NAME] [--preset PRESET]"
   case "$installer" in
     http://*|https://*)
       local fname; fname=$(basename "${installer%%\?*}"); [ -n "$fname" ] || fname=setup.exe
@@ -484,7 +981,8 @@ cmd_install() { # installer [--bottle B] [--name N]
   [ -f "$installer" ] || die "no such file: $installer"
   local base; base=$(basename "$installer"); base="${base%.*}"
   [ -n "$bottle" ] || bottle="${name:-$base}"
-  bottle_exists "$bottle" || cmd_bottle_create "$bottle"
+  if ! bottle_exists "$bottle"; then cmd_bottle_create "$bottle" "$preset"
+  elif [ -n "$preset" ]; then cmd_bottle_create "$bottle" "$preset"; fi
   use_bottle "$bottle"
 
   local before after log; before="$CACHE/lnk-before.$$"; after="$CACHE/lnk-after.$$"
@@ -530,7 +1028,16 @@ cmd_add() { # name --bottle B --exe PATH [--args A]
   done
   [ -n "$name" ] && [ -n "$bottle" ] && [ -n "$exe" ] || die "usage: burrow add NAME --bottle BOTTLE --exe 'C:\\...\\program.exe' [--args '...']"
   bottle_exists "$bottle" || die "no bottle named '$bottle'"
-  case "$exe" in /*) use_bottle "$bottle"; exe=$(win_path "$WINEPREFIX" "$exe") ;; esac
+  # A Mac path: inside the bottle it becomes C:\…; anywhere else Wine reaches it through Z:.
+  case "$exe" in
+    /*)
+      [ -f "$exe" ] || die "no such file: $exe"
+      local prefix; prefix=$(bottle_prefix "$bottle")
+      case "$exe" in
+        "$prefix"/drive_c/*) exe=$(win_path "$prefix" "$exe") ;;
+        *) exe="Z:$(printf '%s' "$exe" | tr '/' '\\')" ;;
+      esac ;;
+  esac
   lib_add "$name" "$bottle" "$exe" "$args" >/dev/null
   ok "Added $name"
 }
@@ -557,13 +1064,14 @@ cmd_launch() { # app [--graphics G] [-- extra args]
   f=$(lib_file "$id")
   local name bottle target args
   name=$(conf_get "$f" name); bottle=$(conf_get "$f" bottle); target=$(conf_get "$f" target)
-  args=$(conf_get "$f" args); [ -n "$graphics" ] || graphics=$(conf_get "$f" graphics)
+  args=$(conf_get "$f" args)
   if [ "$bottle" = "$STEAM_BOTTLE" ] && [ "$(conf_get "$f" steam_appid 2>/dev/null)" != "" ]; then
     cmd_steam_play "$(conf_get "$f" steam_appid)"; return
   fi
-  use_bottle "$bottle" "$graphics"
+  use_bottle "$bottle" "$graphics" "$id"
   local log; log=$(new_log "$name")
-  { echo "burrow $BURROW_VERSION launch '$name' on $BOTTLE_ENGINE"; env | grep -E '^(WINE|DYLD|GST|MTL|MVK)' ; } > "$log"
+  { echo "burrow $BURROW_VERSION launch '$name' on $BOTTLE_ENGINE"; env | grep -E '^(WINE|DYLD|GST|MTL|MVK)'
+    local v; for v in $BURROW_USER_ENV; do printf '%s=%s\n' "$v" "$(printenv "$v")"; done; } > "$log"
   step "Starting $name ($BOTTLE_ENGINE)…  log: $log"
   # `start /wait` follows .lnk shortcuts and sets the program's own folder as the working dir.
   # shellcheck disable=SC2086
@@ -606,7 +1114,7 @@ watch_webhelpers() { # runs in the background until the bottle's wineserver exit
 }
 
 cmd_steam_install() {
-  bottle_exists "$STEAM_BOTTLE" || cmd_bottle_create "$STEAM_BOTTLE"
+  bottle_exists "$STEAM_BOTTLE" || cmd_bottle_create "$STEAM_BOTTLE" gaming
   use_bottle "$STEAM_BOTTLE"
   if [ -f "$(steam_root)/steam.exe" ] || [ -f "$(steam_root)/Steam.exe" ]; then ok "Windows Steam is installed"; return 0; fi
   local setup="$CACHE/SteamSetup.exe"
@@ -808,6 +1316,15 @@ build_window_app() { # dest
   <key>LSApplicationCategoryType</key><string>public.app-category.games</string>
   <key>NSHighResolutionCapable</key><true/>
   <key>NSAppleEventsUsageDescription</key><string>Burrow opens Terminal to install Homebrew.</string>
+  <key>CFBundleDocumentTypes</key>
+  <array>
+    <dict>
+      <key>CFBundleTypeName</key><string>Windows Program</string>
+      <key>CFBundleTypeRole</key><string>Viewer</string>
+      <key>LSHandlerRank</key><string>Alternate</string>
+      <key>CFBundleTypeExtensions</key><array><string>exe</string><string>msi</string></array>
+    </dict>
+  </array>
 </dict>
 </plist>
 PLIST
@@ -910,6 +1427,11 @@ cmd_usage() { # [--plain] [--ram]
     fi
     k=$(kb_size "$ENGINES"); total=$((total + k)); rows="$rows$(printf 'engine\tWine engines\t%s' "$k")
 "
+    if [ -d "$SNAPSHOTS" ]; then
+      # On APFS snapshots share space with their bottles, so this overstates what they cost.
+      k=$(kb_size "$SNAPSHOTS"); total=$((total + k)); rows="$rows$(printf 'snapshot\tSnapshots\t%s' "$k")
+"
+    fi
     k=$(( $(kb_size "$RUNTIMES") + $(kb_size "$CACHE") + $(kb_size "$LOGS") )); total=$((total + k))
     rows="$rows$(printf 'other\tDownloads, cache and logs\t%s' "$k")
 "
@@ -972,10 +1494,10 @@ cmd_status() {
 
 cmd_kill() { # [bottle] stops every program in a bottle (or all bottles)
   local d
-  if [ -n "${1:-}" ]; then use_bottle "$1"; "$WINESERVER" -k 2>/dev/null; ok "Stopped everything in '$1'"; return; fi
+  if [ -n "${1:-}" ]; then bottle_exists "$1" || die "no bottle named '$1'"; stop_bottle "$1"; ok "Stopped everything in '$1'"; return; fi
   for d in "$BOTTLES"/*/; do
     [ -d "$d/prefix" ] || continue
-    ( use_bottle "$(basename "$d")" && "$WINESERVER" -k 2>/dev/null )
+    stop_bottle "$(basename "$d")"
   done
   ok "Stopped all Windows programs"
 }
@@ -993,12 +1515,19 @@ ${B}Burrow $BURROW_VERSION${N}: Windows programs and Windows Steam on your Mac.
   burrow steam play "Schedule I"   start a Steam game
   burrow steam sync                put your Steam games in the library
   ${B}burrow install${N} <setup.exe|url>   install a Windows program into its own bottle
+                                   (--bottle NAME, --preset gaming|apps|legacy|retro|desktop)
   burrow apps                      list your library
   burrow launch <app>              start a program (--graphics turbo|compat)
   burrow shortcut <app>            make a Mac app for it in ~/Applications/Burrow
   burrow add NAME --bottle B --exe 'C:\\path\\app.exe'
   burrow remove <app>
-  burrow bottle new|list|delete|engine
+  burrow bottle new NAME [--preset P]   a new Windows install (also: list, clone, delete)
+  ${B}burrow desktop${N} <bottle> [WxH]       open a bottle as a whole Windows desktop in one window
+  ${B}burrow settings${N} <bottle> [key value] compatibility settings (--app <app> for one program)
+  burrow settings --list           what every setting does
+  burrow presets                   ready-made settings for games, apps, old games…
+  burrow snapshot save|list|restore|delete <bottle>   save a bottle and roll back to it
+  burrow components <bottle> [install vcrun2022 …]    Visual C++, .NET, fonts (winetricks)
   burrow run <bottle> <program.exe> [args]
   burrow winecfg [bottle]          Wine's settings window
   burrow kill [bottle]             force-quit Windows programs
@@ -1013,7 +1542,7 @@ EOF
 
 main() {
   local cmd="${1:-help}"; shift || true
-  mkdir -p "$ENGINES" "$RUNTIMES" "$BOTTLES" "$LIBRARY" "$LOGS" "$CACHE" 2>/dev/null
+  mkdir -p "$ENGINES" "$RUNTIMES" "$BOTTLES" "$LIBRARY" "$LOGS" "$CACHE" "$SNAPSHOTS" 2>/dev/null
   case "$cmd" in
     setup) cmd_setup ;;
     turbo) cmd_turbo "$@" ;;
@@ -1028,8 +1557,13 @@ main() {
     remove|rm) cmd_remove "$@" ;;
     shortcut) cmd_shortcut "$@" ;;
     bottle|bottles) cmd_bottle "$@" ;;
+    settings|config|set) cmd_settings "$@" ;;
+    presets) cmd_presets "$@" ;;
+    snapshot|snapshots|snap) cmd_snapshot "$@" ;;
+    desktop) cmd_desktop "$@" ;;
+    components|component|winetricks) cmd_components "$@" ;;
     run) cmd_run "$@" ;;
-    winecfg|settings) cmd_winecfg "$@" ;;
+    winecfg|wine-settings) cmd_winecfg "$@" ;;
     kill|stop) cmd_kill "$@" ;;
     doctor) cmd_doctor ;;
     app) cmd_app "$@" ;;

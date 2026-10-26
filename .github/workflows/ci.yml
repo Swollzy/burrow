@@ -2,7 +2,7 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    branches: ['**']
     tags: ['v*']
   pull_request:
   workflow_dispatch:
@@ -32,6 +32,26 @@ jobs:
       - uses: actions/checkout@v4
       - name: Scripts parse with the system bash 3.2
         run: /bin/bash -n bin/burrow && /bin/bash -n install.sh
+      - name: Settings, snapshots and bottles under the system bash 3.2
+        run: |
+          export BURROW_HOME="$RUNNER_TEMP/bash32"
+          b="/bin/bash bin/burrow"
+          $b settings --list >/dev/null
+          $b presets --plain | grep -q '^retro'
+          # A stand-in bottle; Wine isn't installed here, so registry settings wait for the next start.
+          mkdir -p "$BURROW_HOME/bottles/Test/prefix/drive_c" && touch "$BURROW_HOME/bottles/Test/bottle.conf"
+          $b settings Test retina=on dpi=144 virtual_desktop=1280x800
+          $b settings Test dpi | grep -qx 144
+          ! $b settings Test dpi 5000 2>/dev/null
+          $b settings Test preset legacy
+          $b settings Test --plain | grep -q "^windows_version	win7	bottle	"
+          $b bottle list --plain | grep -q "^Test	compat	win7	legacy	off$"
+          $b snapshot save Test "first"
+          $b snapshot list Test --plain | grep -q "	first	"
+          $b bottle clone Test Copy
+          test -d "$BURROW_HOME/bottles/Copy/prefix/drive_c"
+          $b bottle delete Copy --yes
+          $b usage --plain | grep -q "^DISK	snapshot	"
       - name: Compile the window app
         run: |
           swiftc -O -swift-version 5 -parse-as-library -target arm64-apple-macos13.0 app/BurrowApp.swift -o /tmp/Burrow-arm64
