@@ -7,7 +7,7 @@
 # no mapfile. Run `burrow help` for the commands.
 set -u
 
-BURROW_VERSION="0.3.1"
+BURROW_VERSION="0.3.2"
 
 # --- Paths and pinned downloads -------------------------------------------------------
 BURROW_HOME="${BURROW_HOME:-$HOME/Library/Application Support/Burrow}"
@@ -19,7 +19,14 @@ LOGS="$BURROW_HOME/logs"
 CACHE="$BURROW_HOME/cache"
 SNAPSHOTS="$BURROW_HOME/snapshots"
 SHORTCUTS="${BURROW_SHORTCUTS:-$HOME/Applications/Burrow}"
-here="$(cd "$(dirname "$0")" && pwd)"
+# Follow symlinks (install.sh links ~/.local/bin/burrow here) to find Burrow's own folder.
+# macOS's readlink has no -f before 12.3, so resolve one link at a time.
+self="$0"
+while [ -L "$self" ]; do
+  link=$(readlink "$self")
+  case "$link" in /*) self="$link" ;; *) self="$(dirname "$self")/$link" ;; esac
+done
+here="$(cd "$(dirname "$self")" && pwd)"
 APPDIR="$(cd "$here/.." && pwd)"
 
 # Wine 11.18 is the version the turbo patches were tested against (Neutron, 2026-10).
@@ -1108,13 +1115,21 @@ steam_root() { printf '%s/%s' "$(bottle_prefix "$STEAM_BOTTLE")" "$STEAM_REL"; }
 
 # Puts Burrow's wrapper in front of every steamwebhelper.exe. Steam replaces the file when it
 # updates, so this runs before each launch and keeps watching while Steam is open.
-wrap_webhelpers() { # quiet?
-  local root wrapper f dir changed=0
+file_mtime() { stat -c %Y "$1" 2>/dev/null || stat -f %m "$1" 2>/dev/null || echo 0; } # GNU, then BSD
+
+wrap_webhelpers() { # quiet? (set by the watcher, which runs while Steam is open)
+  local root wrapper f dir changed=0 now
   root=$(steam_root); wrapper="$APPDIR/wrapper/steamwebhelper.exe"
   [ -f "$wrapper" ] || die "missing $wrapper (re-download Burrow)"
   while IFS= read -r f; do
     [ -n "$f" ] || continue
     grep -aq "$WRAPPER_MARKER" "$f" 2>/dev/null && continue
+    # While Steam is open, a helper that changed in the last few seconds may still be being
+    # written by Steam's updater; swapping it then makes Steam reinstall its update forever.
+    if [ -n "${1:-}" ]; then
+      now=$(date +%s)
+      [ $((now - $(file_mtime "$f"))) -ge 10 ] || continue
+    fi
     dir=$(dirname "$f")
     mv -f "$f" "$dir/steamwebhelper_real.exe" && cp "$wrapper" "$f" && changed=1
   done < <(find "$root/bin/cef" -name steamwebhelper.exe 2>/dev/null)
@@ -1165,7 +1180,9 @@ cmd_steam_open() { # [extra steam args]
   (
     watch_webhelpers "$flag" &
     # -no-cef-sandbox: Chromium's sandbox doesn't work under Wine.
-    "$WINE" "$(steam_exe_win)" -no-cef-sandbox "$@" >"$log" 2>&1
+    # -noverifyfiles: Steam would see Burrow's wrapper as a damaged file and reinstall its
+    # update in a loop.
+    "$WINE" "$(steam_exe_win)" -no-cef-sandbox -noverifyfiles "$@" >"$log" 2>&1
     "$WINESERVER" -w 2>/dev/null
     : > "$flag"
     rm -f "$BOTTLES/$STEAM_BOTTLE/.steam-running"

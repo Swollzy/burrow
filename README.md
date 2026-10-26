@@ -176,7 +176,9 @@ logs). Each launch writes a log to `logs/` there, which is what to send when a g
   of `steamwebhelper.exe` that runs it with `--disable-gpu --single-process` (the fix from
   [steam-on-m1-wine](https://github.com/notpop/steam-on-m1-wine)). Steam replaces that file
   when it updates, so Burrow re-applies the wrapper before every launch and keeps watching
-  while Steam is open.
+  while Steam is open (leaving files alone while Steam's updater is still writing them).
+  Steam starts with `-noverifyfiles`; otherwise it sees the wrapper as a damaged file and
+  reinstalls its update in a loop.
 
 ## What won't work
 
@@ -206,7 +208,7 @@ anything Mac-specific (Rosetta, Metal, the turbo build).
 
 CI (`.github/workflows/ci.yml`) runs ShellCheck and those tests on Linux, and on macOS
 checks the scripts with the system bash 3.2, compiles the window app for Apple Silicon and
-Intel, compiles the fallback menu and runs `burrow app`. Pushing a tag like `v0.3.1` that
+Intel, compiles the fallback menu and runs `burrow app`. Pushing a tag like `v0.3.2` that
 matches `BURROW_VERSION` in `bin/burrow` publishes the zip as a GitHub release.
 
 Rebuild the wrapper with:

@@ -105,8 +105,12 @@ check "steam games skips redistributables" '! "$burrow" steam games | grep -q 22
 st="$BURROW_HOME/bottles/Steam/prefix/drive_c/burrow-test"
 check "webhelper wrapped" 'grep -aq BURROW-WEBHELPER-WRAPPER-1 "$sroot/bin/cef/cef.win64/steamwebhelper.exe"'
 check "Valve helper kept as _real" '[ -f "$sroot/bin/cef/cef.win64/steamwebhelper_real.exe" ]'
-check "steam started with -no-cef-sandbox" 'tr -d "\000" < "$st/steam.txt" | grep -q -- "-no-cef-sandbox"'
+check "steam started with -no-cef-sandbox -noverifyfiles" 'tr -d "\000" < "$st/steam.txt" | grep -q -- "-no-cef-sandbox -noverifyfiles"'
 check "helper got CPU flags then Steam args" 'tr -d "\000" < "$st/helper.txt" | grep -q -- "--disable-gpu --single-process -lang=en_US --type=browser"'
+
+# Run through a symlink, the way install.sh puts burrow on the PATH.
+mkdir -p "$work/linkbin" && ln -s "$burrow" "$work/linkbin/burrow"
+check "works through a symlink (finds its wrapper)" '"$work/linkbin/burrow" steam fix >/dev/null 2>&1'
 
 # Steam "updates" the helper: the next launch must wrap it again.
 cp "$work/fakehelper.exe" "$sroot/bin/cef/cef.win64/steamwebhelper.exe"
