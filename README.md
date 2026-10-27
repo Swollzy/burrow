@@ -6,8 +6,8 @@ Run Windows programs and **Windows Steam** on a Mac, the way CrossOver does: eac
 lives in its own "bottle" (a private Windows folder), and you open them from Burrow's window
 or from Mac shortcuts in your Dock.
 
-> **Status: early.** The command-line tool is tested against Linux Wine, and CI compiles the
-> Mac window on every push, but Burrow hasn't been run end to end on a real Mac yet. Expect
+> **Status: early.** The command-line tool is tested against Linux Wine, CI compiles the
+> Mac window on every push, and Kyle has tested Burrow on a Mac with a couple of Windows games. Expect
 > rough edges, and send the log from `~/Library/Application Support/Burrow/logs` when
 > something fails.
 
