@@ -24,6 +24,11 @@ done
 cp "$work/fakeapp.exe" "$work/fake-setup.exe"
 
 "$burrow" setup >/dev/null 2>&1 || true   # downloads DXMT; fine if offline
+# Downloads shown in Burrow's window: progress every 10%, not a redrawn bar per line.
+mkdir -p "$work/dx/dxmt-v9.99/x86_64-windows" && head -c 3000000 /dev/urandom > "$work/dx/dxmt-v9.99/x86_64-windows/d3d11.dll"
+tar -czf "$work/dx.tar.gz" -C "$work/dx" dxmt-v9.99
+BURROW_DXMT_VERSION=v9.99 BURROW_DXMT_URL="file://$work/dx.tar.gz" "$burrow" setup > "$work/dl.txt" 2>&1
+check "download progress suits a log window" '[ -d "$BURROW_HOME/runtimes/dxmt-v9.99/x86_64-windows" ] && ! grep -q "#" "$work/dl.txt" && [ "$(grep -c "%" "$work/dl.txt")" -le 11 ]'
 "$burrow" bottle new Games >/dev/null
 check "bottle created" '[ -d "$BURROW_HOME/bottles/Games/prefix/drive_c" ]'
 check "bottle reports Windows 10" 'grep -q "\"Version\"=\"win10\"" "$BURROW_HOME/bottles/Games/prefix/user.reg"'
@@ -166,6 +171,7 @@ rm -f "$sroot"/steamapps/appmanifest_222222[1-4].acf
 mkdir -p "$BURROW_HOME/runtimes/dxmt-v0.80/x86_64-windows" "$sroot/steamapps/common/Schedule I"
 head -c 2000000 /dev/zero > "$sroot/steamapps/common/Schedule I/game.bin"   # stands in for the DXMT download
 check "status line" '"$burrow" status | grep -q "^setup=1 turbo=0 steam=1 clt=0 "'
+check "status reports the hardware and macOS version" '"$burrow" status | grep -q " arm=0 rosetta=1 macos=0$"'
 check "usage lists bottles, games and free space" 'out=$("$burrow" usage --plain); printf "%s" "$out" | grep -q "^DISK	bottle	Steam	" && printf "%s" "$out" | grep -q "^DISK	game	Schedule I	" && printf "%s" "$out" | grep -q "^FREE	[0-9]"'
 "$burrow" run Games notepad >/dev/null 2>&1 &
 for _ in 1 2 3 4 5 6 7 8 9 10; do "$burrow" usage --ram --plain | grep -qi "notepad.exe" && break; sleep 1; done
@@ -279,6 +285,16 @@ for _ in 1 2 3 4 5 6 7 8 9 10; do "$burrow" usage --ram --plain | grep -qi "note
 "$burrow" cleanup >/dev/null 2>&1
 check "cleanup leaves engines alone while programs run" '[ -d "$h/engines/wine-9.0" ]'
 "$burrow" kill Tweak >/dev/null 2>&1
+
+# Without Apple Silicon, turbo (DXMT) is never used, even when it has been built.
+ln -sf "$WINEBIN" "$h/engines/wine-11.18-turbo/bin/wine"
+"$burrow" add T1 --bottle Tweak --exe 'C:\windows\notepad.exe' >/dev/null
+BURROW_FOREGROUND=0 "$burrow" launch T1 >/dev/null 2>&1; sleep 2; "$burrow" kill Tweak >/dev/null 2>&1
+lastlog=$(ls -t "$h"/logs/t1-*.log | head -1)
+check "without Apple Silicon, auto never picks turbo" 'head -1 "$lastlog" | grep -q " on wine-11.18$"'
+check "asking for turbo without Apple Silicon says why" '"$burrow" launch T1 --graphics turbo 2>&1 | grep -q "needs an Apple Silicon Mac"'
+check "turbo build refuses without Apple Silicon" 'BURROW_TURBO_ANYWHERE=0 "$burrow" turbo 2>&1 | grep -qE "Mac itself|Apple Silicon"'
+"$burrow" remove T1 >/dev/null
 rm -rf "$h/engines/wine-11.18" "$h/engines/wine-11.18-turbo" "$h/engines/wine-9.0"
 
 echo; echo "$pass passed, $fail failed"

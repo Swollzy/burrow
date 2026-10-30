@@ -218,6 +218,9 @@ logs). Each launch writes a log to `logs/` there, which is what to send when a g
   doesn't allow us to ship it and it only runs on older CrossOver-based Wine. A later
   version could use a copy you download from Apple yourself.
 - Rosetta 2 is being phased out after macOS 27 (Apple is keeping a subset for games).
+- Intel Macs: Windows programs run, but turbo graphics (DXMT) needs Apple Silicon, so Burrow
+  doesn't offer it there and games use compatible graphics (wined3d). Older and 2D games are
+  fine; most new 3D games won't run.
 
 ## Development
 

@@ -185,6 +185,12 @@ final class BurrowModel: ObservableObject {
     @Published var consoleText = ""
     @Published var jobRunning = false
     @Published var lastJobFailed = false
+    /// Set when a job fails, so the job strip can say so after its console was hidden.
+    @Published var failedJobTitle: String?
+    /// A bottle whose programs the user asked to force-quit (confirmed first).
+    @Published var bottleToStop: String?
+    private var currentJob: Process?
+    private var stopRequested = false
 
     let home: String
     let cli: String
@@ -376,7 +382,23 @@ final class BurrowModel: ObservableObject {
 
     /// Jobs asked for while another one runs (an install dropped on the window during setup)
     /// wait their turn instead of being dropped.
-    private var queuedJobs: [(title: String, args: [String], then: (() -> Void)?)] = []
+    @Published private(set) var queuedJobs: [(title: String, args: [String], then: (() -> Void)?)] = []
+
+    /// A job is running or waiting: quitting now would cut it off.
+    var jobBusy: Bool { jobRunning || !queuedJobs.isEmpty }
+
+    /// Stops the running job (and drops the queued ones). Its direct children (curl, the
+    /// installer, `wineserver -w`) are stopped too, so bash isn't left waiting on them.
+    func stopJob() {
+        queuedJobs.removeAll()
+        guard let p = currentJob, p.isRunning else { return }
+        stopRequested = true
+        let kids = Process()
+        kids.executableURL = URL(fileURLWithPath: "/usr/bin/pkill")
+        kids.arguments = ["-TERM", "-P", String(p.processIdentifier)]
+        do { try kids.run(); kids.waitUntilExit() } catch {}
+        p.terminate()
+    }
 
     /// Runs a long job and streams its output into the console sheet.
     func runJob(_ title: String, _ args: [String], then: (() -> Void)? = nil) {
@@ -404,6 +426,8 @@ final class BurrowModel: ObservableObject {
         consoleTitle = title
         consoleText = keepText ? consoleText + "\n\n── \(title) ──\n" : ""
         lastJobFailed = false
+        failedJobTitle = nil
+        stopRequested = false
         jobRunning = true
         showConsole = true
         guard cliExists else {
@@ -421,7 +445,12 @@ final class BurrowModel: ObservableObject {
             let data = handle.availableData
             guard !data.isEmpty else { return }
             let chunk = String(decoding: data, as: UTF8.self)
-            DispatchQueue.main.async { self?.consoleText += chunk }
+            DispatchQueue.main.async {
+                guard let self = self else { return }
+                self.consoleText += chunk
+                // Long builds print a lot; keep the newest part so the window stays quick.
+                if self.consoleText.count > 400_000 { self.consoleText = "…\n" + String(self.consoleText.suffix(300_000)) }
+            }
         }
         p.terminationHandler = { [weak self] proc in
             // Children that outlive the job (wineserver, Steam) can keep the pipe open, so the
@@ -432,10 +461,23 @@ final class BurrowModel: ObservableObject {
                 guard let self = self else { return }
                 if !rest.isEmpty { self.consoleText += String(decoding: rest, as: UTF8.self) }
                 self.jobRunning = false
+                self.currentJob = nil
+                if self.stopRequested {
+                    self.stopRequested = false
+                    self.lastJobFailed = false
+                    self.consoleText += "\n■ Stopped. Windows it opened (an installer, say) may still be open; close them yourself."
+                    self.refreshAll()
+                    return
+                }
                 self.lastJobFailed = proc.terminationStatus != 0
                 self.consoleText += self.lastJobFailed
                     ? "\n✗ Stopped with an error. Use Copy to include this when reporting a problem."
                     : "\n✓ Done."
+                if self.lastJobFailed {
+                    // Hidden consoles come back for errors, and the job strip keeps a note.
+                    self.failedJobTitle = title
+                    self.showConsole = true
+                }
                 self.refreshAll()
                 let failed = self.lastJobFailed
                 if !failed { then?() }
@@ -444,6 +486,7 @@ final class BurrowModel: ObservableObject {
         }
         do {
             try p.run()
+            currentJob = p
         } catch {
             consoleText += "\nCouldn't start burrow: \(error.localizedDescription)"
             jobRunning = false
@@ -574,7 +617,17 @@ final class BurrowModel: ObservableObject {
 
     /// Files dropped on the window or opened from Finder with Burrow.
     func openFiles(_ urls: [URL]) {
-        guard let url = urls.first(where: { ["exe", "msi"].contains($0.pathExtension.lowercased()) }) else { return }
+        guard let url = urls.first(where: { ["exe", "msi"].contains($0.pathExtension.lowercased()) }) else {
+            if let other = urls.first {
+                alertText = "Burrow installs Windows programs (.exe or .msi files). \(other.lastPathComponent) isn't one."
+            }
+            return
+        }
+        // Steam's own installer belongs in the Steam bottle, where the Steam tab and its fixes are.
+        if url.lastPathComponent.lowercased().hasPrefix("steamsetup") {
+            if status.has("steam") { openSteam() } else { installSteam() }
+            return
+        }
         present(.install(url, nil))
     }
 
@@ -626,14 +679,15 @@ final class BurrowModel: ObservableObject {
     }
 
     func makeShortcut(_ app: LibraryApp) {
-        capture(["shortcut", app.id]) { _ in
+        run(["shortcut", app.id]) { [weak self] code, out in
+            guard code == 0 else { self?.alertText = out.isEmpty ? "Couldn't make the shortcut." : out; return }
             let folder = URL(fileURLWithPath: NSHomeDirectory() + "/Applications/Burrow")
             NSWorkspace.shared.open(folder)
         }
     }
 
     func remove(_ app: LibraryApp) {
-        capture(["remove", app.id]) { [weak self] _ in self?.refreshApps() }
+        runOrAlert(["remove", app.id]) { [weak self] in self?.refreshApps() }
     }
 
     func openSteam() { fire(["steam"]) }
@@ -643,7 +697,19 @@ final class BurrowModel: ObservableObject {
     }
 
     func syncSteam() {
-        capture(["steam", "sync"]) { [weak self] _ in self?.refreshApps() }
+        run(["steam", "sync"]) { [weak self] code, out in
+            guard let self = self else { return }
+            self.refreshApps()
+            let lines = out.split(separator: "\n").map(String.init)
+            let added = lines.filter { $0.contains("Added ") }.count
+            if code != 0 {
+                self.alertText = out.isEmpty ? "Couldn't read your Steam games." : out
+            } else if added > 0 {
+                self.alertText = added == 1 ? "Added 1 game to your library." : "Added \(added) games to your library."
+            } else {
+                self.alertText = lines.last ?? "Your Steam games are already in the library."
+            }
+        }
     }
 
     func play(_ game: SteamGame) { fire(["steam", "play", game.id]) }
@@ -660,12 +726,25 @@ final class BurrowModel: ObservableObject {
         NSWorkspace.shared.open(URL(fileURLWithPath: home + (sub.isEmpty ? "" : "/" + sub)))
     }
 
-    /// Homebrew's installer asks for your password, so it has to run in Terminal.
+    /// Homebrew's installer asks for your password, so it has to run in Terminal. Opening a
+    /// .command file there needs no Automation permission (which people often decline).
     func installHomebrewInTerminal() {
-        let cmd = "/bin/bash -c \\\"$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)\\\""
-        let script = "tell application \"Terminal\"\nactivate\ndo script \"\(cmd)\"\nend tell"
-        var error: NSDictionary?
-        _ = NSAppleScript(source: script)?.executeAndReturnError(&error)
+        let command = "/bin/bash -c \"$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)\""
+        let script = "#!/bin/bash\n# Opened by Burrow: installs Homebrew from brew.sh. It asks for your Mac password.\n"
+            + command + "\necho\necho \"Done. You can close this window and go back to Burrow.\"\n"
+        let url = FileManager.default.temporaryDirectory.appendingPathComponent("Install Homebrew for Burrow.command")
+        let fallback = "Couldn't open Terminal. Open Terminal yourself and paste:\n\n" + command
+        do {
+            try script.write(to: url, atomically: true, encoding: .utf8)
+            try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: url.path)
+        } catch {
+            alertText = fallback
+            return
+        }
+        let terminal = URL(fileURLWithPath: "/System/Applications/Utilities/Terminal.app")
+        NSWorkspace.shared.open([url], withApplicationAt: terminal, configuration: NSWorkspace.OpenConfiguration()) { [weak self] _, error in
+            if error != nil { DispatchQueue.main.async { self?.alertText = fallback } }
+        }
     }
 }
 
@@ -677,7 +756,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         DispatchQueue.main.async { BurrowModel.shared.openFiles(urls) }
     }
 
-    func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { true }
+    /// With a job running, closing the window keeps Burrow going (click its Dock icon to come back).
+    func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
+        !BurrowModel.shared.jobBusy
+    }
+
+    /// Quitting would cut a running job off partway (an install, the turbo build), so ask first.
+    func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+        let model = BurrowModel.shared
+        guard model.jobBusy else { return .terminateNow }
+        let alert = NSAlert()
+        alert.messageText = "\(model.consoleTitle) is still running."
+        alert.informativeText = "Quitting stops it partway. Keep Burrow open until it's done, or stop it now."
+        alert.addButton(withTitle: "Keep Running")
+        alert.addButton(withTitle: "Stop and Quit")
+        guard alert.runModal() == .alertSecondButtonReturn else { return .terminateCancel }
+        model.stopJob()
+        return .terminateNow
+    }
 }
 
 @main
@@ -710,7 +806,8 @@ struct ContentView: View {
     private let setupTab = 4
 
     var body: some View {
-        VStack {
+        VStack(spacing: 0) {
+            JobStrip()
             TabView(selection: $tab) {
                 LibraryView(goToSetup: { tab = setupTab })
                     .tabItem { Label("Library", systemImage: "square.grid.2x2") }.tag(0)
@@ -752,6 +849,20 @@ struct ContentView: View {
             }
             return true
         }
+        // Installs that finish outside Burrow (Command Line Tools, Homebrew in Terminal, the
+        // GStreamer package) show up when you come back to the window.
+        .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in
+            model.refreshStatus()
+        }
+        .confirmationDialog("Force quit the programs in \(model.bottleToStop ?? "")?",
+                            isPresented: Binding(get: { model.bottleToStop != nil }, set: { if !$0 { model.bottleToStop = nil } })) {
+            Button("Force Quit", role: .destructive) {
+                if let b = model.bottleToStop { model.stopBottle(b) }
+                model.bottleToStop = nil
+            }
+        } message: {
+            Text("Unsaved progress in its games and programs will be lost.")
+        }
         // The status arrives a moment after launch; open on Setup until Wine is installed.
         .onReceive(model.$status) { status in
             guard status.loaded, !choseStartTab else { return }
@@ -779,7 +890,7 @@ struct LibraryView: View {
             }
             if model.status.loaded && !model.status.has("setup") {
                 Banner(text: "Burrow needs to download Wine first.", button: "Go to Setup", action: goToSetup)
-            } else if model.status.loaded && !model.status.has("turbo") {
+            } else if model.status.loaded && !model.status.has("turbo") && model.status.has("arm") {
                 Banner(text: "Turbo graphics isn't built yet, so 3D games will be slow or won't start.",
                        button: "Go to Setup", action: goToSetup)
             }
@@ -838,6 +949,8 @@ struct AppCard: View {
                 } label: { Image(systemName: "ellipsis.circle") }
                 .menuStyle(.borderlessButton)
                 .frame(width: 28)
+                .help("More actions")
+                .accessibilityLabel("More actions for \(app.name)")
             }
             Text(app.name).font(.headline).lineLimit(2)
             Text(app.isSteamGame ? "Steam" : "Bottle: \(app.bottle)").font(.caption).foregroundColor(.secondary)
@@ -946,7 +1059,7 @@ struct UsageView: View {
                         Text("Free on this Mac")
                         Spacer()
                         Text(humanKB(model.diskFree))
-                            .foregroundColor(model.diskFree < 20 * 1_048_576 ? Color.orange : Color.primary)
+                            .foregroundColor(model.diskFree > 0 && model.diskFree < 20 * 1_048_576 ? Color.orange : Color.primary)
                     }
                     if model.diskFree > 0 && model.diskFree < 20 * 1_048_576 {
                         Text("Under 20 GB free: big games may not fit.").font(.caption).foregroundColor(.orange)
@@ -972,7 +1085,7 @@ struct UsageView: View {
                                     Text(group.id)
                                     Spacer()
                                     Text(humanKB(group.rows.reduce(0) { $0 + $1.kb }))
-                                    Button("Quit") { model.stopBottle(group.id) }.controlSize(.small)
+                                    Button("Force Quit…") { model.bottleToStop = group.id }.controlSize(.small)
                                 }) {
                                     ForEach(group.rows) { p in
                                         HStack { Text(p.name); Spacer(); Text(humanKB(p.kb)).foregroundColor(.secondary) }
@@ -1036,6 +1149,12 @@ struct SetupView: View {
                         detail: "The open source Windows layer and the Direct3D-to-Metal graphics layer (about 300 MB).") {
                     Button("Download") { model.runJob("Downloading Wine and DXMT", ["setup"]) }
                 }
+                if model.status.has("arm") && model.status.flags["rosetta"] == "0" {
+                    StepRow(done: false, title: "Rosetta 2",
+                            detail: "Apple's translator for Intel code. Wine needs it on Apple Silicon; Setup installs it.") {
+                        Button("Install") { model.runJob("Installing Rosetta 2", ["setup"]) }
+                    }
+                }
                 StepRow(done: model.status.has("clt"), title: "Apple Command Line Tools",
                         detail: "Free from Apple. Needed to build turbo graphics and this window.") {
                     Button("Install") { model.runJob("Apple Command Line Tools", ["tools"]) }
@@ -1044,12 +1163,19 @@ struct SetupView: View {
                         detail: "Free tool installer from brew.sh. It asks for your Mac password, so it opens in Terminal.") {
                     Button("Install in Terminal…") { model.installHomebrewInTerminal() }
                 }
-                StepRow(done: model.status.has("turbo"), title: "Turbo graphics",
-                        detail: model.status.has("arm") || !model.status.has("mac")
-                            ? "Builds fast Metal graphics that most 3D games need. One time, a few minutes."
-                            : "Needs an Apple Silicon Mac.") {
-                    Button("Build") { model.runJob("Building turbo graphics", ["turbo"]) }
-                        .disabled(!model.status.has("setup") || !model.status.has("clt") || !model.status.has("brew"))
+                if model.status.has("arm") || !model.status.has("mac") {
+                    StepRow(done: model.status.has("turbo"), title: "Turbo graphics",
+                            detail: "Builds fast Metal graphics that most 3D games need. One time, a few minutes.") {
+                        Button("Build") { model.runJob("Building turbo graphics", ["turbo"]) }
+                            .disabled(!model.status.has("setup") || !model.status.has("clt") || !model.status.has("brew"))
+                            .help(model.status.has("setup") && model.status.has("clt") && model.status.has("brew")
+                                  ? "" : "Finish the steps above first.")
+                    }
+                } else {
+                    StepRow(done: false, unavailable: true, title: "Turbo graphics",
+                            detail: "Needs an Apple Silicon Mac. On this Mac games use compatible graphics, which suits older and 2D games; most new 3D games won't run.") {
+                        EmptyView()
+                    }
                 }
                 StepRow(done: model.status.has("steam"), title: "Windows Steam",
                         detail: "Installs Steam from Valve into its own bottle.") {
@@ -1077,21 +1203,63 @@ struct SetupView: View {
 
 struct StepRow<Actions: View>: View {
     let done: Bool
+    var unavailable = false
     let title: String
     let detail: String
     @ViewBuilder var actions: () -> Actions
 
     var body: some View {
         HStack(alignment: .top, spacing: 12) {
-            Image(systemName: done ? "checkmark.circle.fill" : "circle")
+            Image(systemName: done ? "checkmark.circle.fill" : (unavailable ? "minus.circle" : "circle"))
                 .font(.title2)
                 .foregroundColor(done ? Color.green : Color.secondary)
+                .accessibilityLabel(done ? "Done" : (unavailable ? "Not available" : "Not done"))
             VStack(alignment: .leading, spacing: 2) {
                 Text(title).font(.headline)
                 Text(detail).font(.callout).foregroundColor(.secondary).fixedSize(horizontal: false, vertical: true)
             }
             Spacer()
-            if !done { actions() }
+            if !done && !unavailable { actions() }
+        }
+    }
+}
+
+/// A line above the tabs while a job runs (or after one failed), so a hidden console is never lost.
+struct JobStrip: View {
+    @EnvironmentObject var model: BurrowModel
+    @State private var confirmStop = false
+
+    var body: some View {
+        if model.jobRunning || model.failedJobTitle != nil {
+            HStack(spacing: 10) {
+                if model.jobRunning {
+                    ProgressView().controlSize(.small)
+                    Text(model.consoleTitle).lineLimit(1)
+                    if !model.queuedJobs.isEmpty {
+                        Text("· \(model.queuedJobs.count) more waiting").foregroundColor(.secondary)
+                    }
+                } else {
+                    Image(systemName: "xmark.octagon.fill").foregroundColor(.red)
+                    Text("\(model.failedJobTitle ?? "A job") stopped with an error.").lineLimit(1)
+                }
+                Spacer()
+                Button("Show") { model.showConsole = true }
+                if model.jobRunning {
+                    Button("Stop…") { confirmStop = true }
+                } else {
+                    Button("Dismiss") { model.failedJobTitle = nil }
+                }
+            }
+            .padding(.horizontal, 12)
+            .padding(.vertical, 6)
+            .background(RoundedRectangle(cornerRadius: 8)
+                .fill((model.jobRunning ? Color.accentColor : Color.red).opacity(0.12)))
+            .padding([.horizontal, .top])
+            .confirmationDialog("Stop \(model.consoleTitle)?", isPresented: $confirmStop) {
+                Button("Stop", role: .destructive) { model.stopJob() }
+            } message: {
+                Text("It stops partway. Run it again later to finish.")
+            }
         }
     }
 }
@@ -1140,8 +1308,12 @@ struct ConsoleView: View {
                     NSPasteboard.general.clearContents()
                     NSPasteboard.general.setString(model.consoleText, forType: .string)
                 }
+                Button("Show Logs") { model.openFolder("logs") }
                 Spacer()
-                if model.jobRunning { Text("You can close this; the job keeps going.").font(.caption).foregroundColor(.secondary) }
+                if model.jobRunning {
+                    Text("You can hide this; the job keeps going.").font(.caption).foregroundColor(.secondary)
+                    Button("Stop", role: .destructive) { model.stopJob() }
+                }
                 Button(model.jobRunning ? "Hide" : "Close") { model.showConsole = false }
                     .keyboardShortcut(.defaultAction)
             }
@@ -1235,12 +1407,14 @@ struct BottleRow: View {
                 Divider()
                 Button("Show C: Drive in Finder") { model.openDrive(bottle.id) }
                 Button("Wine Settings (winecfg)") { model.wineSettings(bottle.id) }
-                Button("Quit Its Programs") { model.stopBottle(bottle.id) }
+                Button("Force Quit Its Programs…") { model.bottleToStop = bottle.id }
                 Divider()
                 Button("Delete Bottle…", role: .destructive, action: onDelete)
             } label: { Image(systemName: "ellipsis.circle") }
             .menuStyle(.borderlessButton)
             .frame(width: 28)
+            .help("More actions")
+            .accessibilityLabel("More actions for \(bottle.id)")
         }
         .padding(12)
         .background(RoundedRectangle(cornerRadius: 10).fill(Color(nsColor: .controlBackgroundColor)))
@@ -1318,6 +1492,11 @@ struct InstallSheet: View {
     @State private var existing = ""
     @State private var preset = ""
 
+    private var nameTaken: Bool {
+        let n = newName.trimmingCharacters(in: .whitespaces)
+        return model.bottles.contains(where: { $0.id == n })
+    }
+
     var body: some View {
         VStack(alignment: .leading, spacing: 14) {
             Text("Install \(url.lastPathComponent)").font(.headline)
@@ -1329,6 +1508,11 @@ struct InstallSheet: View {
                 .pickerStyle(.radioGroup)
                 if intoNew {
                     TextField("Bottle name", text: $newName)
+                    if nameTaken {
+                        Text("There's already a bottle called \(newName.trimmingCharacters(in: .whitespaces)). Pick another name, or choose it under An existing bottle.")
+                            .font(.caption).foregroundColor(.orange)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
                     PresetPicker(preset: $preset)
                 } else {
                     Picker("Bottle", selection: $existing) {
@@ -1353,13 +1537,18 @@ struct InstallSheet: View {
                     model.afterSheet { model.install(file, bottle: bottle, preset: p) }
                 }
                 .keyboardShortcut(.defaultAction)
-                .disabled(intoNew ? bottleNameProblem(newName) != nil : existing.isEmpty)
+                .disabled(intoNew ? (bottleNameProblem(newName) != nil || nameTaken) : existing.isEmpty)
             }
         }
         .padding()
         .frame(width: 560)
         .onAppear {
-            newName = url.deletingPathExtension().lastPathComponent
+            // Named after the installer, numbered when that bottle already exists.
+            let base = url.deletingPathExtension().lastPathComponent
+            var name = base
+            var n = 2
+            while model.bottles.contains(where: { $0.id == name }) { name = "\(base) \(n)"; n += 1 }
+            newName = name
             if let b = preselected, model.bottles.contains(where: { $0.id == b }) {
                 intoNew = false
                 existing = b
@@ -1554,6 +1743,8 @@ struct SnapshotsSheet: View {
                         Button("Restore") { toRestore = s }.disabled(busy)
                         Button(role: .destructive) { delete(s) } label: { Image(systemName: "trash") }
                             .buttonStyle(.borderless)
+                            .help("Delete this snapshot")
+                            .accessibilityLabel("Delete snapshot")
                             .disabled(busy)
                     }
                     .padding(.vertical, 2)

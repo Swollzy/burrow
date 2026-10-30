@@ -56,6 +56,9 @@ warn() { printf '%s!%s %s\n' "$Y" "$N" "$*" >&2; }
 die()  { printf '%serror:%s %s\n' "$R" "$N" "$*" >&2; exit 1; }
 
 is_mac() { [ "$(uname -s)" = "Darwin" ]; }
+# The hardware, not the shell: a Terminal set to "Open using Rosetta" reports x86_64 from uname -m.
+apple_silicon() { [ "$(sysctl -n hw.optional.arm64 2>/dev/null)" = 1 ] || [ "$(uname -m)" = arm64 ]; }
+mac_major() { sw_vers -productVersion 2>/dev/null | cut -d. -f1; }
 cpu_count() { sysctl -n hw.ncpu 2>/dev/null || nproc 2>/dev/null || echo 4; }
 
 # APFS clone on a Mac (nearly free), plain copy elsewhere.
@@ -90,7 +93,19 @@ download() { # url dest
   local tmp="$2.part"
   mkdir -p "$(dirname "$2")"
   say "${D}  $1${N}"
-  curl -fL --retry 3 --retry-delay 2 --progress-bar -o "$tmp" "$1" || { rm -f "$tmp"; return 1; }
+  # A connection that stalls (under 1 KB/s for a minute) fails instead of hanging forever.
+  local opts=(-fL --retry 3 --retry-delay 2 --speed-limit 1024 --speed-time 60)
+  if [ -t 2 ]; then
+    curl "${opts[@]}" --progress-bar -o "$tmp" "$1" || { rm -f "$tmp"; return 1; }
+  else
+    # Burrow's window shows output as a log, where curl's redrawn bar becomes thousands of lines:
+    # print every 10% instead.
+    curl "${opts[@]}" --progress-bar -o "$tmp" "$1" 2>&1 | tr '\r' '\n' | awk '
+      /[0-9.]+%[[:space:]]*$/ { match($0, /[0-9.]+%/); p = int(substr($0, RSTART, RLENGTH - 1) / 10)
+                                if (p > last) { last = p; printf "  %d%%\n", p * 10; fflush() } next }
+      /[^#[:space:]]/ { print; fflush() }'
+    [ "${PIPESTATUS[0]}" = 0 ] || { rm -f "$tmp"; return 1; }
+  fi
   mv "$tmp" "$2"
 }
 
@@ -119,7 +134,9 @@ engine_wineserver() {
   printf '%s/bin/wineserver' "$(engine_root "$1")"
 }
 engine_ok() { engine_wine "$1" >/dev/null 2>&1; }
-best_engine() { if engine_ok "$TURBO_ENGINE"; then echo "$TURBO_ENGINE"; else echo "$STOCK_ENGINE"; fi; }
+# Turbo (DXMT) needs Apple Silicon; an Intel Mac stays on the compatible engine even if turbo was built.
+turbo_usable() { apple_silicon || [ "${BURROW_TURBO_ANYWHERE:-0}" = 1 ]; }
+best_engine() { if turbo_usable && engine_ok "$TURBO_ENGINE"; then echo "$TURBO_ENGINE"; else echo "$STOCK_ENGINE"; fi; }
 
 # --- Settings ------------------------------------------------------------------------------------
 # Every setting has a scope: "bottle" (the whole Windows install, mostly registry), "both" (set
@@ -261,7 +278,8 @@ bottle_exists() { bottle_name_ok "$1" && [ -d "$(bottle_prefix "$1")/drive_c" ];
 
 graphics_engine() { # graphics-setting -> engine
   case "$1" in
-    turbo|dxmt) engine_ok "$TURBO_ENGINE" || die "turbo graphics isn't built yet; run: burrow turbo"; echo "$TURBO_ENGINE" ;;
+    turbo|dxmt) turbo_usable || die "turbo graphics needs an Apple Silicon Mac; use auto or compat here"
+                engine_ok "$TURBO_ENGINE" || die "turbo graphics isn't built yet; run: burrow turbo"; echo "$TURBO_ENGINE" ;;
     compat|wined3d) echo "$STOCK_ENGINE" ;;
     auto|"") best_engine ;;
     *) die "unknown graphics mode '$1' (use auto, turbo or compat)" ;;
@@ -755,14 +773,14 @@ check_mac() {
   is_mac || { warn "not a Mac; only the tests run here"; return 0; }
   local major; major=$(sw_vers -productVersion | cut -d. -f1)
   [ "$major" -ge 11 ] || die "Burrow needs macOS 11 or newer (this is $(sw_vers -productVersion))"
-  if [ "$(uname -m)" = arm64 ]; then
+  if apple_silicon; then
     if ! /usr/bin/arch -x86_64 /usr/bin/true 2>/dev/null; then
       step "Installing Rosetta 2 (Apple's Intel translator; Wine needs it)…"
       softwareupdate --install-rosetta --agree-to-license || die "Rosetta didn't install; run: softwareupdate --install-rosetta"
     fi
     ok "Apple Silicon with Rosetta 2"
   else
-    warn "Intel Mac: Windows programs will run, but turbo graphics (DXMT) needs Apple Silicon"
+    warn "Intel Mac: Windows programs run with compatible graphics; turbo graphics (DXMT) needs Apple Silicon"
   fi
 }
 
@@ -826,7 +844,7 @@ cmd_setup() {
     warn "  https://gstreamer.freedesktop.org/download/#macos  (the 'runtime installer' .pkg)"
   fi
   if engine_ok "$TURBO_ENGINE"; then ok "Turbo graphics is built"
-  else say ""; say "Next: ${B}burrow turbo${N} builds the fast Metal graphics most 3D games need (one time, a few minutes)."; fi
+  elif turbo_usable; then say ""; say "Next: ${B}burrow turbo${N} builds the fast Metal graphics most 3D games need (one time, a few minutes)."; fi
   say "Then: ${B}burrow steam${N} installs and opens Windows Steam."
 }
 
@@ -839,10 +857,10 @@ turbo_assemble_failed() { rm -rf "$1"; die "couldn't assemble the turbo engine (
 
 cmd_turbo() {
   is_mac || [ "${BURROW_TURBO_ANYWHERE:-0}" = 1 ] || die "turbo graphics is built on the Mac itself"
+  turbo_usable || die "turbo graphics (DXMT) needs an Apple Silicon Mac; on this Mac games use compatible graphics"
   engine_ok "$STOCK_ENGINE" || cmd_setup
   install_dxmt
   if [ "${1:-}" != "--rebuild" ] && engine_ok "$TURBO_ENGINE"; then ok "Turbo graphics is already built (burrow turbo --rebuild to redo it)"; return 0; fi
-  [ "$(uname -m)" = arm64 ] || warn "DXMT needs Apple Silicon; building anyway"
 
   step "Checking build tools…"
   if ! xcode-select -p >/dev/null 2>&1; then
@@ -1060,6 +1078,7 @@ cmd_install() { # installer [--bottle B] [--name N] [--preset P]
     *.msi|*.MSI) "$WINE" msiexec /i "$installer" >"$log" 2>&1 ;;
     *) (cd "$(dirname "$installer")" && "$WINE" "$installer" >"$log" 2>&1) ;;
   esac
+  say "${D}Waiting for the installer, and anything it started, to close…${N}"
   "$WINESERVER" -w 2>/dev/null
   list_shortcuts "$WINEPREFIX" > "$after"
 
@@ -1246,7 +1265,7 @@ cmd_steam_open() { # [extra steam args]
     "$WINE" "$(steam_exe_win)" "$@" >/dev/null 2>&1 &
     return 0
   fi
-  [ "$BOTTLE_ENGINE" = "$TURBO_ENGINE" ] || warn "Turbo graphics isn't built, so 3D games will be slow or fail. Run: burrow turbo"
+  [ "$BOTTLE_ENGINE" = "$TURBO_ENGINE" ] || ! turbo_usable || warn "Turbo graphics isn't built, so 3D games will be slow or fail. Run: burrow turbo"
   wrap_webhelpers
   local log flag; log=$(new_log steam); flag="$BOTTLES/$STEAM_BOTTLE/.steam-closed"
   rm -f "$flag"
@@ -1395,11 +1414,21 @@ build_window_app() { # dest
   fi
   local major; major=$(sw_vers -productVersion | cut -d. -f1)
   if [ "$major" -lt 13 ]; then warn "the Burrow window needs macOS 13 or newer; using the simple menu"; return 1; fi
+  # .formStyle(.grouped) and friends need the macOS 13 SDK; old Command Line Tools have an older one.
+  local sdk; sdk=$(xcrun --sdk macosx --show-sdk-version 2>/dev/null | cut -d. -f1)
+  if [ -n "$sdk" ] && [ "$sdk" -lt 13 ] 2>/dev/null; then
+    warn "Apple's Command Line Tools here are too old for the Burrow window (macOS $sdk SDK); using the simple menu."
+    warn "Update them in System Settings > General > Software Update, then run: burrow app"
+    return 1
+  fi
+  # Built for the hardware, so the window (and everything it runs) isn't stuck under Rosetta
+  # when Terminal happens to be.
+  local arch=x86_64; apple_silicon && arch=arm64
   step "Building the Burrow window app…"
   local tmp; tmp=$(mktemp -d -t burrow-app) || return 1
   local log="$LOGS/app-build.log"
   # Through xcrun so swiftc is told where the macOS SDK is; run bare it can't find it.
-  if ! xcrun --sdk macosx swiftc -O -swift-version 5 -parse-as-library -target "$(uname -m)-apple-macos13.0" \
+  if ! xcrun --sdk macosx swiftc -O -swift-version 5 -parse-as-library -target "$arch-apple-macos13.0" \
         "$src" -o "$tmp/Burrow" > "$log" 2>&1; then
     warn "The window app didn't compile (details in $log); using the simple menu."
     rm -rf "$tmp"
@@ -1561,15 +1590,18 @@ cmd_cleanup() { # [--dry-run] [--quiet] [--keep-app PATH] [--if-updated]
 cmd_doctor() {
   step "Burrow $BURROW_VERSION doctor"
   if is_mac; then
-    say "macOS $(sw_vers -productVersion) on $(uname -m)"
-    if [ "$(uname -m)" = arm64 ]; then
+    local hw=Intel; apple_silicon && hw="Apple Silicon"
+    say "macOS $(sw_vers -productVersion) on $hw$([ "$(sysctl -n sysctl.proc_translated 2>/dev/null)" = 1 ] && printf ' (this Terminal runs under Rosetta)')"
+    if apple_silicon; then
       /usr/bin/arch -x86_64 /usr/bin/true 2>/dev/null && ok "Rosetta 2" || warn "Rosetta 2 missing (burrow setup installs it)"
     fi
     [ -d /Library/Frameworks/GStreamer.framework ] && ok "GStreamer (in-game video)" || warn "GStreamer missing: game intro videos may be black"
   fi
   engine_ok "$STOCK_ENGINE" && ok "Wine $WINE_VERSION" || warn "Wine missing: burrow setup"
   [ -d "$RUNTIMES/dxmt-$DXMT_VERSION/x86_64-windows" ] && ok "DXMT $DXMT_VERSION downloaded" || warn "DXMT missing: burrow setup"
-  engine_ok "$TURBO_ENGINE" && ok "Turbo graphics built" || warn "Turbo graphics not built: burrow turbo"
+  if ! turbo_usable; then say "Turbo graphics: needs Apple Silicon; this Mac uses compatible graphics"
+  elif engine_ok "$TURBO_ENGINE"; then ok "Turbo graphics built"
+  else warn "Turbo graphics not built: burrow turbo"; fi
   if bottle_exists "$STEAM_BOTTLE"; then
     [ -f "$(steam_root)/steam.exe" ] || [ -f "$(steam_root)/Steam.exe" ] && ok "Windows Steam installed" || warn "Steam bottle exists but Steam isn't installed: burrow steam install"
     local unwrapped; unwrapped=$(find "$(steam_root)/bin/cef" -name steamwebhelper.exe 2>/dev/null | while IFS= read -r f; do grep -aq "$WRAPPER_MARKER" "$f" || echo "$f"; done)
@@ -1686,21 +1718,33 @@ cmd_tools() {
   is_mac || die "this is for the Mac"
   if xcode-select -p >/dev/null 2>&1; then ok "Apple's Command Line Tools are installed"; return 0; fi
   xcode-select --install 2>/dev/null || true
-  say "Click Install in the window that opened. When it finishes, come back and continue."
+  say "Click Install in the window that opened. Burrow waits until it's done (usually 5-15 minutes)."
+  local waited=0
+  until xcode-select -p >/dev/null 2>&1; do
+    sleep 10; waited=$((waited + 10))
+    [ $((waited % 120)) = 0 ] && say "${D}  still waiting for the Command Line Tools…${N}"
+    [ "$waited" -ge 3600 ] && die "the Command Line Tools still aren't installed; press Install again when you're ready"
+  done
+  ok "Apple's Command Line Tools are installed"
 }
 
-# One line of flags for Burrow.app: "setup=1 turbo=0 steam=1 clt=1 brew=0 gst=0 mac=1 arm=1".
+# One line of flags for Burrow.app: "setup=1 turbo=0 steam=1 clt=1 brew=0 gst=0 mac=1 arm=1 rosetta=1 macos=15".
 cmd_status() {
-  local s=0 t=0 st=0 clt=0 brew=0 gst=0 mac=0 arm=0
+  local s=0 t=0 st=0 clt=0 brew=0 gst=0 mac=0 arm=0 rosetta=1 macos=0
   { [ -n "${BURROW_WINE:-}" ] || engine_ok "$STOCK_ENGINE"; } && [ -d "$RUNTIMES/dxmt-$DXMT_VERSION/x86_64-windows" ] && s=1
   engine_ok "$TURBO_ENGINE" && t=1
   { [ -f "$(steam_root)/steam.exe" ] || [ -f "$(steam_root)/Steam.exe" ]; } && st=1
   is_mac && mac=1
-  [ "$(uname -m)" = arm64 ] && arm=1
+  apple_silicon && arm=1
+  if is_mac; then
+    macos=$(mac_major); macos=${macos:-0}
+    [ "$arm" = 1 ] && { /usr/bin/arch -x86_64 /usr/bin/true 2>/dev/null || rosetta=0; }
+  fi
   is_mac && xcode-select -p >/dev/null 2>&1 && clt=1
   { [ -x /opt/homebrew/bin/brew ] || [ -x /usr/local/bin/brew ]; } && brew=1
   [ -d /Library/Frameworks/GStreamer.framework ] && gst=1
-  printf 'setup=%s turbo=%s steam=%s clt=%s brew=%s gst=%s mac=%s arm=%s\n' "$s" "$t" "$st" "$clt" "$brew" "$gst" "$mac" "$arm"
+  printf 'setup=%s turbo=%s steam=%s clt=%s brew=%s gst=%s mac=%s arm=%s rosetta=%s macos=%s\n' \
+    "$s" "$t" "$st" "$clt" "$brew" "$gst" "$mac" "$arm" "$rosetta" "$macos"
 }
 
 cmd_kill() { # [bottle] stops every program in a bottle (or all bottles)
