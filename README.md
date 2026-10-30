@@ -55,6 +55,25 @@ The window has five tabs:
   program, grouped by bottle, with Quit buttons.
 - **Setup**: each step with a check mark, plus "Check Everything" and the logs folder.
 
+## Share it as a DMG (no Terminal for friends)
+
+On your Mac, download this repo (**Code → Download ZIP**, or `git clone`) and double-click
+**Make DMG.command**. It compiles the Burrow window for Apple Silicon and Intel, puts the
+command-line tool inside the app, ad-hoc signs it and writes `~/Desktop/DMGs/Burrow-<version>.dmg`:
+a window with Burrow, an arrow, the Applications folder and a "Read Me First".
+
+- If macOS won't open the `.command`: System Settings > Privacy & Security > **Open Anyway**,
+  or in Terminal type `bash ` and drag the file in.
+- The first time, macOS asks whether Terminal may control Finder. Click **OK**: that lays out
+  the DMG window. Saying no still makes a working, plain-looking DMG.
+- Friends drag Burrow to Applications and do macOS's one-time **Open Anyway** step (the Read
+  Me walks through it). On first launch Burrow copies its tool to
+  `~/Library/Application Support/Burrow/app`, the same place `install.sh` uses.
+- A paid Apple Developer account removes that warning. `dmg/make-dmg.sh` already supports
+  `DEVELOPER_ID="Developer ID Application: …"` and `NOTARY_PROFILE=<notarytool profile>`
+  (untested, as there's no account yet).
+- Build errors go to `~/Desktop/DMGs/Burrow-build-error.log`.
+
 ## Bottles: lightweight Windows VMs
 
 A bottle is a private Windows install: its own C: drive, registry, settings and programs.
@@ -193,11 +212,14 @@ logs). Each launch writes a log to `logs/` there, which is what to send when a g
 ```
 bin/burrow                 the whole CLI (bash 3.2, as shipped with macOS)
 app/BurrowApp.swift        the SwiftUI window; runs bin/burrow for everything
+app/Info.plist             the window app's Info.plist (install.sh and the DMG both use it)
 app/Burrow.applescript     fallback menu when the window can't be compiled
 engine/wine-patches/       Wine patches for turbo graphics (from Neutron)
 wrapper/                   the steamwebhelper wrapper (source and prebuilt .exe)
 tests/                     Linux Wine tests with small Windows test programs
 scripts/package.sh         builds dist/Burrow-<version>.zip
+Make DMG.command           builds ~/Desktop/DMGs/Burrow-<version>.dmg on a Mac
+dmg/                       DMG build: stage.sh, make-dmg.sh, window background, Read Me
 ```
 
 `tests/run-tests.sh` runs Burrow against Linux Wine with small Windows test programs

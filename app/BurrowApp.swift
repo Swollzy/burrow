@@ -192,8 +192,44 @@ final class BurrowModel: ObservableObject {
     private init() {
         let env = ProcessInfo.processInfo.environment
         home = env["BURROW_HOME"] ?? (NSHomeDirectory() + "/Library/Application Support/Burrow")
+        if env["BURROW_CLI"] == nil { BurrowModel.installBundledCLI(into: home + "/app") }
         cli = env["BURROW_CLI"] ?? (home + "/app/bin/burrow")
         refreshAll()
+    }
+
+    /// The DMG build carries the burrow tool inside the app (Contents/Resources/burrow-cli).
+    /// Copy it to where install.sh puts it, so shortcuts and `burrow` in Terminal keep working
+    /// when the app is moved or replaced. Only copies when the bundled tool is different.
+    static func installBundledCLI(into dest: String) {
+        let fm = FileManager.default
+        guard let res = Bundle.main.resourcePath else { return }
+        let bundled = res + "/burrow-cli"
+        guard let fresh = fm.contents(atPath: bundled + "/bin/burrow") else { return }
+        if fm.contents(atPath: dest + "/bin/burrow") == fresh { return }
+        let staging = dest + ".new"
+        do {
+            try fm.createDirectory(atPath: (dest as NSString).deletingLastPathComponent,
+                                   withIntermediateDirectories: true)
+            try? fm.removeItem(atPath: staging)
+            try fm.copyItem(atPath: bundled, toPath: staging)
+            try? fm.removeItem(atPath: dest)
+            try fm.moveItem(atPath: staging, toPath: dest)
+            try fm.setAttributes([.posixPermissions: 0o755], ofItemAtPath: dest + "/bin/burrow")
+        } catch {
+            NSLog("Burrow: couldn't install the bundled tool: \(error)")
+            return
+        }
+        // Copies of a downloaded app keep its quarantine flag; clear it the way install.sh does.
+        let xattr = Process()
+        xattr.executableURL = URL(fileURLWithPath: "/usr/bin/xattr")
+        xattr.arguments = ["-dr", "com.apple.quarantine", dest]
+        do { try xattr.run(); xattr.waitUntilExit() } catch {}
+        // Like install.sh, let `burrow` work in Terminal; leave an existing link alone.
+        let bin = NSHomeDirectory() + "/.local/bin"
+        if (try? fm.destinationOfSymbolicLink(atPath: bin + "/burrow")) == nil {
+            try? fm.createDirectory(atPath: bin, withIntermediateDirectories: true)
+            try? fm.createSymbolicLink(atPath: bin + "/burrow", withDestinationPath: dest + "/bin/burrow")
+        }
     }
 
     var cliExists: Bool { FileManager.default.fileExists(atPath: cli) }
@@ -232,7 +268,7 @@ final class BurrowModel: ObservableObject {
 
     /// Runs a command and hands back its exit status and everything it printed, errors included.
     func run(_ args: [String], done: @escaping (Int32, String) -> Void) {
-        guard cliExists else { done(1, "Burrow's command-line tool is missing at \(cli). Run install.sh again."); return }
+        guard cliExists else { done(1, "Burrow's command-line tool is missing at \(cli). Reopen Burrow from Applications, or run install.sh again."); return }
         let p = makeProcess(args)
         let pipe = Pipe()
         p.standardOutput = pipe
@@ -297,7 +333,7 @@ final class BurrowModel: ObservableObject {
         jobRunning = true
         showConsole = true
         guard cliExists else {
-            consoleText = "Burrow's command-line tool is missing at:\n\(cli)\nRun install.sh again."
+            consoleText = "Burrow's command-line tool is missing at:\n\(cli)\nReopen Burrow from Applications, or run install.sh again."
             jobRunning = false
             lastJobFailed = true
             return
