@@ -40,6 +40,11 @@ VERSION="$(bash "${HERE}/dmg/stage.sh" "${WORK}/Burrow")" || finish 1
 printf '\n\033[1mBurrow %s\033[0m\n' "${VERSION}"
 mkdir -p "${OUT}"
 if bash "${HERE}/dmg/make-dmg.sh" "${WORK}/Burrow" "${OUT}"; then
+    # Older Burrow DMGs in the folder are out of date now.
+    for old in "${OUT}"/Burrow-*.dmg; do
+        [[ -f "${old}" ]] || continue
+        case "$(basename "${old}")" in "Burrow-${VERSION}.dmg"|"Burrow-${VERSION}-"*.dmg) ;; *) rm -f "${old}"; echo "  Removed the older ${old##*/}" ;; esac
+    done
     open "${OUT}"
     echo
     echo "  Send friends the .dmg. It has a 'Read Me First' with the one-time"

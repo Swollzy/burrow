@@ -194,7 +194,19 @@ final class BurrowModel: ObservableObject {
         home = env["BURROW_HOME"] ?? (NSHomeDirectory() + "/Library/Application Support/Burrow")
         if env["BURROW_CLI"] == nil { BurrowModel.installBundledCLI(into: home + "/app") }
         cli = env["BURROW_CLI"] ?? (home + "/app/bin/burrow")
+        cleanupAfterUpdate()
         refreshAll()
+    }
+
+    /// The first time a new version opens, clear out what older versions left behind (old Wine
+    /// engines and downloads, an older Burrow.app in the other Applications folder). Bottles,
+    /// games and settings stay. Does nothing once it has run for this version.
+    private func cleanupAfterUpdate() {
+        guard cliExists else { return }
+        let p = makeProcess(["cleanup", "--if-updated", "--quiet", "--keep-app", Bundle.main.bundlePath])
+        p.standardOutput = FileHandle.nullDevice
+        p.standardError = FileHandle.nullDevice
+        try? p.run()
     }
 
     /// The DMG build carries the burrow tool inside the app (Contents/Resources/burrow-cli).
@@ -1052,6 +1064,8 @@ struct SetupView: View {
                 Divider()
                 HStack {
                     Button("Check Everything") { model.runJob("Checking everything", ["doctor"]) }
+                    Button("Clean Up Old Files") { model.runJob("Cleaning up old files", ["cleanup", "--keep-app", Bundle.main.bundlePath]) }
+                        .help("Removes what older versions of Burrow left behind. Bottles, games and settings stay.")
                     Button("Show Logs") { model.openFolder("logs") }
                     Button("Refresh") { model.refreshAll() }
                 }

@@ -250,8 +250,36 @@ check "re-adding in the same bottle replaces its entry" '[ ! -f "$BURROW_HOME/li
 check "bottle delete keeps other bottles' apps" '[ ! -f "$BURROW_HOME/library/direct-2.app.conf" ] && [ -f "$BURROW_HOME/library/direct.app.conf" ]'
 "$burrow" remove Direct >/dev/null
 check "remove" '! "$burrow" apps | grep -q Direct'
+mkdir -p "$BURROW_SHORTCUTS/Fake App.app/Contents"
 "$burrow" bottle delete Games --yes >/dev/null
 check "bottle delete removes its apps" '! "$burrow" apps | grep -q "Fake App" && [ ! -d "$BURROW_HOME/bottles/Games" ]'
+check "bottle delete removes its apps' Mac shortcuts" '[ ! -d "$BURROW_SHORTCUTS/Fake App.app" ]'
+
+# Cleanup after an update: what older versions left goes, everything of the user's stays.
+for _ in $(seq 1 20); do "$burrow" usage --ram --plain | grep -q "^PROC" || break; sleep 1; done
+h="$BURROW_HOME"
+mkdir -p "$h/engines/wine-10.0/bin" "$h/engines/wine-11.18/bin" "$h/engines/wine-11.18-turbo/bin" \
+  "$h/runtimes/dxmt-v0.70/x86_64-windows" "$h/runtimes/dxmt-v0.80/x86_64-windows" "$h/app.new" "$h/cache/turbo"
+touch "$h/cache/wine-devel-10.0-osx64.tar.xz" "$h/cache/wine-devel-11.18-osx64.tar.xz" \
+  "$h/cache/dxmt-v0.70-builtin.tar.gz" "$h/cache/dxmt-v0.80-builtin.tar.gz" "$h/runtimes/winetricks-20230212" \
+  "$h/cache/half.part" "$h/logs/ancient-20200101-000000.log" "$h/logs/recent-20990101-000000.log"
+touch -t 202001010000 "$h/app.new" "$h/cache/half.part" "$h/logs/ancient-20200101-000000.log"
+(exit 0) & dead=$!; wait "$dead"
+touch "$h/library/x.app.conf.tmp.$dead" "$h/bottles/Tweak/bottle.conf.tmp.$dead"
+"$burrow" cleanup --dry-run >/dev/null
+check "cleanup --dry-run changes nothing" '[ -d "$h/engines/wine-10.0" ] && [ -f "$h/cache/half.part" ]'
+"$burrow" cleanup > "$work/cleanup.txt" 2>&1
+check "cleanup removes old engines, downloads and half-finished files" '[ ! -e "$h/engines/wine-10.0" ] && [ ! -e "$h/runtimes/dxmt-v0.70" ] && [ ! -e "$h/runtimes/winetricks-20230212" ] && [ ! -e "$h/cache/wine-devel-10.0-osx64.tar.xz" ] && [ ! -e "$h/cache/dxmt-v0.70-builtin.tar.gz" ] && [ ! -e "$h/cache/turbo" ] && [ ! -e "$h/app.new" ] && [ ! -e "$h/cache/half.part" ] && [ ! -e "$h/library/x.app.conf.tmp.$dead" ] && [ ! -e "$h/bottles/Tweak/bottle.conf.tmp.$dead" ] && [ ! -e "$h/logs/ancient-20200101-000000.log" ]'
+check "cleanup keeps current engines, downloads, recent logs and the user's things" '[ -d "$h/engines/wine-11.18" ] && [ -d "$h/engines/wine-11.18-turbo" ] && [ -d "$h/runtimes/dxmt-v0.80" ] && [ -f "$h/cache/wine-devel-11.18-osx64.tar.xz" ] && [ -f "$h/cache/dxmt-v0.80-builtin.tar.gz" ] && [ -f "$h/logs/recent-20990101-000000.log" ] && [ -d "$h/bottles/Tweak/prefix/drive_c" ] && [ -d "$h/bottles/Steam/prefix/drive_c" ] && [ -n "$(ls "$h/library")" ]'
+check "cleanup says what it freed" 'grep -q "Freed .* Your bottles, games and settings" "$work/cleanup.txt"'
+mkdir -p "$h/engines/wine-9.0"
+check "cleanup --if-updated runs once per version" '[ "$(cat "$h/.burrow-version")" = "$("$burrow" version | cut -d" " -f2)" ] && "$burrow" cleanup --if-updated && [ -d "$h/engines/wine-9.0" ]'
+"$burrow" run Tweak notepad >/dev/null 2>&1 &
+for _ in 1 2 3 4 5 6 7 8 9 10; do "$burrow" usage --ram --plain | grep -qi "notepad.exe" && break; sleep 1; done
+"$burrow" cleanup >/dev/null 2>&1
+check "cleanup leaves engines alone while programs run" '[ -d "$h/engines/wine-9.0" ]'
+"$burrow" kill Tweak >/dev/null 2>&1
+rm -rf "$h/engines/wine-11.18" "$h/engines/wine-11.18-turbo" "$h/engines/wine-9.0"
 
 echo; echo "$pass passed, $fail failed"
 [ "$fail" = 0 ]

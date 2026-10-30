@@ -72,7 +72,18 @@ a window with Burrow, an arrow, the Applications folder and a "Read Me First".
 - A paid Apple Developer account removes that warning. `dmg/make-dmg.sh` already supports
   `DEVELOPER_ID="Developer ID Application: …"` and `NOTARY_PROFILE=<notarytool profile>`
   (untested, as there's no account yet).
-- Build errors go to `~/Desktop/DMGs/Burrow-build-error.log`.
+- Build errors go to `~/Desktop/DMGs/Burrow-build-error.log`. A new build removes the older
+  `Burrow-*.dmg` files in that folder.
+
+## Updating
+
+Install the new version the same way (the DMG, or `install.sh`). The first time it runs,
+Burrow cleans up what older versions left behind: Wine engines and DXMT versions it no longer
+uses, their downloads and turbo build files, half-finished downloads, logs older than 30 days,
+and an older copy of Burrow.app in the other Applications folder. Your bottles, games,
+snapshots, library, settings and shortcuts stay. Old Wine engines wait while Windows programs
+are running. Run it yourself with `burrow cleanup` (`--dry-run` lists what it would remove) or
+**Clean Up Old Files** on the Setup tab.
 
 ## Bottles: lightweight Windows VMs
 
@@ -160,6 +171,7 @@ burrow shortcut <app>          make a Mac app for it in ~/Applications/Burrow
 burrow usage                   disk space per bottle and game, RAM of running programs
 burrow usage --ram             just the memory of running programs
 burrow doctor                  check everything
+burrow cleanup [--dry-run]     remove files older versions left behind (bottles stay)
 burrow kill                    force-quit Windows programs
 
 burrow bottle new NAME --preset apps    a new bottle (also: list, clone, delete)

@@ -465,7 +465,10 @@ cmd_bottle() {
       fi
       stop_bottle "$name"
       rm -rf "${BOTTLES:?}/${name:?}" "${SNAPSHOTS:?}/${name:?}"
-      grep -lxF "bottle=$name" "$LIBRARY"/*.app.conf 2>/dev/null | while IFS= read -r f; do rm -f "$f"; done
+      grep -lxF "bottle=$name" "$LIBRARY"/*.app.conf 2>/dev/null | while IFS= read -r f; do
+        rm -rf "$SHORTCUTS/$(conf_get "$f" name | tr '/:' '--').app"
+        rm -f "$f"
+      done
       ok "Deleted bottle '$name'" ;;
     clone|copy|duplicate)
       local src="${1:-}" dst="${2:-}"
@@ -814,6 +817,7 @@ install_dxmt() {
 cmd_setup() {
   step "Burrow $BURROW_VERSION setup"
   mkdir -p "$ENGINES" "$RUNTIMES" "$BOTTLES" "$LIBRARY" "$LOGS" "$CACHE"
+  cmd_cleanup --if-updated
   check_mac
   if [ -n "${BURROW_WINE:-}" ]; then ok "Using $BURROW_WINE"; else install_wine; fi
   install_dxmt
@@ -1426,6 +1430,133 @@ build_menu_app() { # dest
   ok "Made $dest (simple menu)"
 }
 
+# --- Cleanup after an update ---------------------------------------------------------------------
+# Removes what earlier versions of Burrow left behind: Wine engines, DXMT and winetricks for
+# versions Burrow no longer uses, their downloads and turbo build trees, half-finished
+# downloads and installs, old logs, and an older copy of Burrow.app in the other Applications
+# folder. Bottles, games, snapshots, the library, settings and shortcuts are never touched.
+VERSION_MARKER="$BURROW_HOME/.burrow-version"
+
+CLEAN_KB=0; CLEAN_N=0; CLEAN_DRY=0; CLEAN_QUIET=0
+clean_path() { # path why
+  [ -e "$1" ] || [ -L "$1" ] || return 0
+  local kb shown="$1"; kb=$(kb_size "$1")
+  case "$1" in "$HOME"/*) shown="~${1#"$HOME"}" ;; esac
+  CLEAN_KB=$((CLEAN_KB + ${kb:-0})); CLEAN_N=$((CLEAN_N + 1))
+  if [ "$CLEAN_QUIET" = 0 ]; then
+    [ "$CLEAN_N" = 1 ] && step "Cleaning up files from older versions of Burrow…"
+    say "  $2: $shown ($(human_kb "${kb:-0}"))"
+  fi
+  [ "$CLEAN_DRY" = 1 ] || rm -rf "$1"
+}
+
+# Temp files named with a process id (.extract.123, file.tmp.123) are stale once it has exited.
+clean_pid_temps() { # glob-prefix why   (files are <prefix><pid>)
+  local f pid
+  for f in "$1"*; do
+    [ -e "$f" ] || continue
+    pid="${f##*.}"
+    case "$pid" in ""|*[!0-9]*) continue ;; esac
+    kill -0 "$pid" 2>/dev/null || clean_path "$f" "$2"
+  done
+}
+
+# Other things in progress (a download, a copy) are stale after an hour untouched.
+clean_stale() { # dir name-pattern why
+  [ -d "$1" ] || return 0
+  local f
+  while IFS= read -r f; do clean_path "$f" "$3"; done < <(find "$1" -maxdepth 1 -name "$2" -mmin +60 2>/dev/null)
+}
+
+bundle_id() { /usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$1/Contents/Info.plist" 2>/dev/null; }
+
+cmd_cleanup() { # [--dry-run] [--quiet] [--keep-app PATH] [--if-updated]
+  local keep_app="" if_updated=0
+  CLEAN_KB=0; CLEAN_N=0; CLEAN_DRY=0; CLEAN_QUIET=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --dry-run|-n) CLEAN_DRY=1; shift ;;
+      --quiet|-q) CLEAN_QUIET=1; shift ;;
+      --keep-app) need_value "$@"; keep_app="${2%/}"; shift 2 ;;
+      --if-updated) if_updated=1; shift ;;
+      *) die "unknown option '$1' (burrow cleanup [--dry-run] [--quiet] [--keep-app PATH])" ;;
+    esac
+  done
+  if [ "$if_updated" = 1 ] && [ "$(cat "$VERSION_MARKER" 2>/dev/null)" = "$BURROW_VERSION" ]; then return 0; fi
+
+  # Half-finished work: installs, downloads, unpacking, settings writes.
+  clean_stale "$BURROW_HOME" 'app.new' "unfinished update"
+  clean_pid_temps "$ENGINES/.extract." "unfinished unpack"
+  clean_pid_temps "$RUNTIMES/.extract." "unfinished unpack"
+  clean_stale "$ENGINES" '*.new' "unfinished turbo build"
+  clean_stale "$CACHE" '*.part' "unfinished download"
+  clean_stale "$CACHE/downloads" '*.part' "unfinished download"
+  clean_pid_temps "$CACHE/lnk-before." "leftover temp file"
+  clean_pid_temps "$CACHE/lnk-after." "leftover temp file"
+  clean_pid_temps "$LIBRARY/" "leftover temp file"   # only matches *.tmp.<pid>, the one kind ending in a number
+  local d f
+  for d in "$BOTTLES"/*/; do [ -d "$d" ] && clean_pid_temps "${d}bottle.conf.tmp." "leftover temp file"; done
+
+  # Engines and runtimes for versions this Burrow doesn't use. Wine can't have its files pulled
+  # out from under a running program, so engines wait while anything runs.
+  if [ -n "$(running_procs)" ]; then
+    [ "$CLEAN_QUIET" = 1 ] || say "  (Windows programs are running, so old Wine engines are left for next time.)"
+  else
+    for d in "$ENGINES"/*/; do
+      [ -d "$d" ] || continue
+      case "$(basename "$d")" in "$STOCK_ENGINE"|"$TURBO_ENGINE"|.*) ;; *) clean_path "${d%/}" "old Wine engine" ;; esac
+    done
+  fi
+  for d in "$RUNTIMES"/dxmt-*/; do
+    [ -d "$d" ] && [ "$(basename "$d")" != "dxmt-$DXMT_VERSION" ] && clean_path "${d%/}" "old DXMT"
+  done
+  for f in "$RUNTIMES"/winetricks-*; do
+    [ -e "$f" ] && [ "$(basename "$f")" != "winetricks-$WINETRICKS_VERSION" ] && clean_path "$f" "old winetricks"
+  done
+  for f in "$CACHE"/wine-devel-*-osx64.tar.xz; do
+    [ -f "$f" ] && [ "$(basename "$f")" != "wine-devel-$WINE_VERSION-osx64.tar.xz" ] && clean_path "$f" "old Wine download"
+  done
+  for f in "$CACHE"/dxmt-*-builtin.tar.gz; do
+    [ -f "$f" ] && [ "$(basename "$f")" != "dxmt-$DXMT_VERSION-builtin.tar.gz" ] && clean_path "$f" "old DXMT download"
+  done
+  # Before 0.3.1 turbo was built here, which never worked (the path has a space).
+  [ "${BURROW_TURBO_WORK:-}" = "$CACHE/turbo" ] || clean_path "$CACHE/turbo" "old turbo build folder"
+  local work; work=$(turbo_workdir 2>/dev/null) || work=""
+  if [ -n "$work" ] && [ -d "$work" ]; then
+    for d in "$work"/wine-* "$work"/build-*; do
+      [ -e "$d" ] || continue
+      case "$(basename "$d")" in "wine-$WINE_VERSION"|"wine-$WINE_VERSION.tar.xz"|"build-$WINE_VERSION") ;; *) clean_path "$d" "old turbo build files" ;; esac
+    done
+  fi
+
+  # Logs older than 30 days (recent ones are what to send when something fails).
+  if [ -d "$LOGS" ]; then
+    while IFS= read -r f; do clean_path "$f" "old log"; done < <(find "$LOGS" -maxdepth 1 -name '*.log' -mtime +30 2>/dev/null)
+  fi
+
+  # An older Burrow.app in the other Applications folder (install.sh puts it in ~/Applications,
+  # the DMG in /Applications). Only when the copy being kept is itself an installed one: a copy
+  # run straight from the DMG, or one macOS moved to a temporary place, keeps everything.
+  if is_mac && [ -n "$keep_app" ] && [ -d "$keep_app" ]; then
+    case "$keep_app" in
+      /Applications/*|"$HOME/Applications/"*)
+        local other
+        for other in /Applications/Burrow.app "$HOME/Applications/Burrow.app"; do
+          [ "$other" = "$keep_app" ] && continue
+          [ -d "$other" ] && [ "$(bundle_id "$other")" = "com.swollzy.burrow" ] && clean_path "$other" "older copy of Burrow"
+        done ;;
+    esac
+  fi
+
+  if [ "$CLEAN_DRY" = 0 ]; then printf '%s\n' "$BURROW_VERSION" > "$VERSION_MARKER" 2>/dev/null || true; fi
+  if [ "$CLEAN_QUIET" = 0 ]; then
+    if [ "$CLEAN_N" = 0 ]; then [ "$if_updated" = 1 ] || ok "Nothing to clean up"
+    elif [ "$CLEAN_DRY" = 1 ]; then ok "Would free $(human_kb "$CLEAN_KB") ($CLEAN_N items)"
+    else ok "Freed $(human_kb "$CLEAN_KB") ($CLEAN_N items). Your bottles, games and settings weren't touched."; fi
+  fi
+  return 0
+}
+
 # --- Housekeeping ----------------------------------------------------------------------------------
 cmd_doctor() {
   step "Burrow $BURROW_VERSION doctor"
@@ -1614,6 +1745,7 @@ ${B}Burrow $BURROW_VERSION${N}: Windows programs and Windows Steam on your Mac.
   burrow usage                     disk space per bottle and game, and RAM of running programs
   burrow usage --ram               just the memory of running programs
   burrow doctor                    check everything
+  burrow cleanup [--dry-run]       remove files older versions left behind (bottles stay)
   burrow app                       (re)build Burrow.app, the window app
 
 Files live in: $BURROW_HOME
@@ -1646,6 +1778,7 @@ main() {
     winecfg|wine-settings) cmd_winecfg "$@" ;;
     kill|stop) cmd_kill "$@" ;;
     doctor) cmd_doctor ;;
+    cleanup|clean) cmd_cleanup "$@" ;;
     app) cmd_app "$@" ;;
     version|--version|-v) say "burrow $BURROW_VERSION" ;;
     help|--help|-h) usage ;;
