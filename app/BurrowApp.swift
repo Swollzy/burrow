@@ -315,20 +315,82 @@ final class BurrowModel: ObservableObject {
         }
     }
 
-    /// Starts something that keeps running on its own (a game, Steam). Output goes to Burrow's logs.
+    /// Starts something that keeps running on its own (a game, Steam). Output goes to Burrow's logs,
+    /// but if burrow itself stops with an error ("Turbo graphics isn't built", "no app called…"),
+    /// that's shown instead of nothing happening.
     func fire(_ args: [String]) {
-        guard cliExists else { return }
+        guard cliExists else { alertText = "Burrow's command-line tool is missing at \(cli). Reopen Burrow from Applications, or run install.sh again."; return }
         let p = makeProcess(args)
         p.standardOutput = FileHandle.nullDevice
-        p.standardError = FileHandle.nullDevice
-        try? p.run()
+        // Errors go to a temporary file, not a pipe: the game or Steam inherit it and outlive
+        // burrow, and writing to a pipe nobody reads any more would kill them.
+        let errURL = FileManager.default.temporaryDirectory.appendingPathComponent("burrow-\(UUID().uuidString).log")
+        FileManager.default.createFile(atPath: errURL.path, contents: nil)
+        let errHandle = try? FileHandle(forWritingTo: errURL)
+        p.standardError = errHandle ?? FileHandle.nullDevice
+        p.terminationHandler = { [weak self] proc in
+            try? errHandle?.close()
+            let text = (try? String(contentsOf: errURL, encoding: .utf8)) ?? ""
+            try? FileManager.default.removeItem(at: errURL)
+            guard proc.terminationStatus != 0 else { return }
+            let errors = text.split(separator: "\n").filter { $0.contains("error:") }.map(String.init)
+            guard !errors.isEmpty else { return }
+            DispatchQueue.main.async { self?.alertText = errors.joined(separator: "\n") }
+        }
+        do {
+            try p.run()
+        } catch {
+            try? errHandle?.close()
+            try? FileManager.default.removeItem(at: errURL)
+            alertText = "Couldn't start burrow: \(error.localizedDescription)"
+        }
     }
+
+    /// Reads what's already in a pipe without waiting for its writers to close it: Wine processes
+    /// that outlive burrow (wineserver, Steam) can hold it open for a long time.
+    static func drainNow(_ handle: FileHandle) -> Data {
+        let fd = handle.fileDescriptor
+        let flags = fcntl(fd, F_GETFL)
+        _ = fcntl(fd, F_SETFL, flags | O_NONBLOCK)
+        var data = Data()
+        var buffer = [UInt8](repeating: 0, count: 65536)
+        while true {
+            let n = read(fd, &buffer, buffer.count)
+            if n <= 0 { break }
+            data.append(contentsOf: buffer[0..<n])
+        }
+        return data
+    }
+
+    /// Jobs asked for while another one runs (an install dropped on the window during setup)
+    /// wait their turn instead of being dropped.
+    private var queuedJobs: [(title: String, args: [String], then: (() -> Void)?)] = []
 
     /// Runs a long job and streams its output into the console sheet.
     func runJob(_ title: String, _ args: [String], then: (() -> Void)? = nil) {
-        guard !jobRunning else { showConsole = true; return }
+        if jobRunning {
+            queuedJobs.append((title: title, args: args, then: then))
+            consoleText += "\n⏳ \(title) starts when this finishes."
+            showConsole = true
+            return
+        }
+        startJob(title, args, then: then, keepText: false)
+    }
+
+    private func startNextJob(afterFailure failed: Bool) {
+        guard !jobRunning, !queuedJobs.isEmpty else { return }
+        if failed {
+            consoleText += "\n\nSkipped because of the error above: " + queuedJobs.map { $0.title }.joined(separator: ", ")
+            queuedJobs.removeAll()
+            return
+        }
+        let next = queuedJobs.removeFirst()
+        startJob(next.title, next.args, then: next.then, keepText: true)
+    }
+
+    private func startJob(_ title: String, _ args: [String], then: (() -> Void)?, keepText: Bool) {
         consoleTitle = title
-        consoleText = ""
+        consoleText = keepText ? consoleText + "\n\n── \(title) ──\n" : ""
         lastJobFailed = false
         jobRunning = true
         showConsole = true
@@ -336,6 +398,7 @@ final class BurrowModel: ObservableObject {
             consoleText = "Burrow's command-line tool is missing at:\n\(cli)\nReopen Burrow from Applications, or run install.sh again."
             jobRunning = false
             lastJobFailed = true
+            startNextJob(afterFailure: true)
             return
         }
         let p = makeProcess(args)
@@ -352,7 +415,7 @@ final class BurrowModel: ObservableObject {
             // Children that outlive the job (wineserver, Steam) can keep the pipe open, so the
             // job ends when the burrow process exits, not at end of output.
             pipe.fileHandleForReading.readabilityHandler = nil
-            let rest = pipe.fileHandleForReading.availableData
+            let rest = BurrowModel.drainNow(pipe.fileHandleForReading)
             DispatchQueue.main.async {
                 guard let self = self else { return }
                 if !rest.isEmpty { self.consoleText += String(decoding: rest, as: UTF8.self) }
@@ -362,15 +425,18 @@ final class BurrowModel: ObservableObject {
                     ? "\n✗ Stopped with an error. Use Copy to include this when reporting a problem."
                     : "\n✓ Done."
                 self.refreshAll()
-                if !self.lastJobFailed { then?() }
+                let failed = self.lastJobFailed
+                if !failed { then?() }
+                self.startNextJob(afterFailure: failed)
             }
         }
         do {
             try p.run()
         } catch {
-            consoleText = "Couldn't start burrow: \(error.localizedDescription)"
+            consoleText += "\nCouldn't start burrow: \(error.localizedDescription)"
             jobRunning = false
             lastJobFailed = true
+            startNextJob(afterFailure: true)
         }
     }
 

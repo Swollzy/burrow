@@ -54,6 +54,35 @@ check "a program outside the bottle is reached through Z:" 'grep -q "^target=Z:.
 "$burrow" add "Direct" --bottle Games --exe 'C:\Program Files\Fake App\Fake App.exe' --args "--hello" >/dev/null
 rm -f "$ran"; "$burrow" launch Direct >/dev/null 2>&1
 check "manual add + launch with args" 'tr -d "\000" < "$ran" | grep -q -- "--hello"'
+"$burrow" add "Quoted" --bottle Games --exe 'C:\Program Files\Fake App\Fake App.exe' --args '-config "C:\My Games\x.ini" *' >/dev/null
+rm -f "$ran"; (cd "$here" && "$burrow" launch Quoted >/dev/null 2>&1)
+check "launch options keep quoted paths and don't glob" 'c=$(tr -d "\000" < "$ran" | grep "^cmd="); case "$c" in *"\"C:\\My Games\\x.ini\""*) ;; *) false ;; esac && case "$c" in *run-tests.sh*) false ;; esac'
+"$burrow" remove Quoted >/dev/null
+
+# A relative installer path still runs the installer (it starts from its own folder).
+mkdir -p "$work/dl/sub"; cp "$work/fakeapp.exe" "$work/dl/sub/other-setup.exe"
+rm -f "$BURROW_HOME/bottles/Games/prefix/drive_c/Program Files/Fake App/Fake App.exe"
+(cd "$work/dl" && "$burrow" install sub/other-setup.exe --bottle Games >/dev/null 2>&1)
+check "install with a relative path runs the installer" '[ -f "$BURROW_HOME/bottles/Games/prefix/drive_c/Program Files/Fake App/Fake App.exe" ]'
+
+# Old logs of other apps whose names start the same way are left alone.
+touch -t 202001010000 "$BURROW_HOME/logs/fake-app-x-20200101-000000.log"
+for i in 01 02 03 04 05 06 07 08 09 10 11 12 13 14 15 16 17 18 19 20 21; do touch -t "2021010100$i" "$BURROW_HOME/logs/fake-app-20210101-0000$i.log"; done
+"$burrow" launch "fake app" >/dev/null 2>&1
+check "log cleanup keeps other apps' logs" '[ -f "$BURROW_HOME/logs/fake-app-x-20200101-000000.log" ] && [ "$(ls "$BURROW_HOME"/logs/fake-app-2*.log | wc -l)" -le 20 ]'
+
+# Names that make the same id must not overwrite each other; a reinstall keeps app settings.
+"$burrow" add "東方" --bottle Games --exe 'C:\a.exe' >/dev/null
+"$burrow" add "ゼルダ" --bottle Games --exe 'C:\b.exe' >/dev/null
+"$burrow" add "Doom" --bottle Games --exe 'C:\d.exe' >/dev/null
+"$burrow" add "DOOM!" --bottle Games --exe 'C:\d2.exe' >/dev/null
+check "non-Latin names each get their own entry" '"$burrow" apps --plain | grep -q "	東方	" && "$burrow" apps --plain | grep -q "	ゼルダ	"'
+check "look-alike names each get their own entry" '[ "$("$burrow" apps --plain | cut -f2 | grep -ci "^doom!*$")" = 2 ]'
+"$burrow" settings --app "DOOM!" cpu_cores=3 >/dev/null
+"$burrow" add "DOOM!" --bottle Games --exe 'C:\d3.exe' >/dev/null
+check "re-adding an app keeps its settings and takes the new target" 'f="$BURROW_HOME/library/$("$burrow" apps --plain | awk -F"\t" "\$2==\"DOOM!\"{print \$1}").app.conf"; grep -qx "cpu_cores=3" "$f" && grep -qxF "target=C:\\d3.exe" "$f"'
+for n in "東方" "ゼルダ" "Doom" "DOOM!"; do "$burrow" remove "$n" >/dev/null; done
+check "removing by name removes the right ones" '! "$burrow" apps --plain | grep -qiE "	(東方|ゼルダ|doom!?)	"'
 
 # Steam, with stand-ins for Steam.exe and steamwebhelper.exe.
 "$burrow" bottle new Steam >/dev/null
@@ -125,6 +154,15 @@ check "library launch of a Steam game goes through Steam" 'tr -d "\000" < "$st/s
 
 check "apps --plain is id<TAB>name<TAB>bottle<TAB>appid" '"$burrow" apps --plain | grep -q "^schedule-i	Schedule I	Steam	3164500$"'
 check "steam games --plain" '"$burrow" steam games --plain | grep -q "^1111111	Data Center$"'
+# Two Steam games with the same name, a non-Latin name, and a name with escaped quotes.
+for g in "2222221 Prey" "2222222 Prey" "2222223 原神" '2222224 The \"Quoted\" Game'; do
+  printf '"AppState"\n{\n\t"appid"\t\t"%s"\n\t"name"\t\t"%s"\n}\n' "${g%% *}" "${g#* }" > "$sroot/steamapps/appmanifest_${g%% *}.acf"
+done
+"$burrow" steam sync >/dev/null; "$burrow" steam sync >/dev/null
+check "steam sync keeps same-name games apart" '[ "$("$burrow" apps --plain | grep -c "	Prey	Steam	222222[12]$")" = 2 ]'
+check "steam sync keeps non-Latin names" '"$burrow" apps --plain | grep -q "	原神	Steam	2222223$"'
+check "steam names lose VDF escapes" '"$burrow" apps --plain | grep -qF "	The \"Quoted\" Game	Steam	2222224"'
+rm -f "$sroot"/steamapps/appmanifest_222222[1-4].acf
 mkdir -p "$BURROW_HOME/runtimes/dxmt-v0.80/x86_64-windows" "$sroot/steamapps/common/Schedule I"
 head -c 2000000 /dev/zero > "$sroot/steamapps/common/Schedule I/game.bin"   # stands in for the DXMT download
 check "status line" '"$burrow" status | grep -q "^setup=1 turbo=0 steam=1 clt=0 "'
@@ -185,6 +223,22 @@ BURROW_FOREGROUND=0 "$burrow" desktop Games 800x600 >/dev/null 2>&1
 for _ in 1 2 3 4 5 6 7 8 9 10; do ps -axww -o command= | grep -q "[d]esktop=Burrow,800x600" && break; sleep 1; done
 check "desktop opens a Windows desktop window" 'ps -axww -o command= | grep -q "[d]esktop=Burrow,800x600"'
 "$burrow" kill Games >/dev/null 2>&1
+
+# Bad input fails fast instead of hanging or reaching outside Burrow's folders.
+hung=""
+for a in "bottle new Nope --preset" "install x.exe --bottle" "launch x --graphics" "settings --app"; do
+  # shellcheck disable=SC2086  # $a is several words on purpose
+  timeout 10 "$burrow" $a 2>&1 | grep -q "needs a value" || hung="$hung [$a]"
+done
+check "a flag without its value fails instead of hanging" '[ -z "$hung" ]'
+check "bottle delete refuses paths" '! "$burrow" bottle delete ../library --yes 2>/dev/null && [ -d "$BURROW_HOME/library" ]'
+
+# A leftover Steam PID file from a crash or restart doesn't stop Steam from opening properly.
+sleep 60 & stale=$!
+echo "$stale" > "$BURROW_HOME/bottles/Steam/.steam-running"
+rm -f "$st/steam.txt"; "$burrow" steam >/dev/null 2>&1
+check "a stale Steam PID file is ignored" 'tr -d "\000" < "$st/steam.txt" 2>/dev/null | grep -q -- "-noverifyfiles"'
+kill "$stale" 2>/dev/null
 
 # Same program name in two bottles: both stay in the library.
 "$burrow" bottle new Other >/dev/null

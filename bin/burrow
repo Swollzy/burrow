@@ -59,7 +59,15 @@ is_mac() { [ "$(uname -s)" = "Darwin" ]; }
 cpu_count() { sysctl -n hw.ncpu 2>/dev/null || nproc 2>/dev/null || echo 4; }
 
 # APFS clone on a Mac (nearly free), plain copy elsewhere.
-clone_tree() { if is_mac; then cp -c -R "$1" "$2" 2>/dev/null || cp -R "$1" "$2"; else cp -R "$1" "$2"; fi; }
+# A clone that fails partway leaves $2 behind, and cp -R into an existing folder would copy to $2/<name>.
+clone_tree() {
+  if is_mac && cp -c -R "$1" "$2" 2>/dev/null; then return 0; fi
+  rm -rf "$2"
+  cp -R "$1" "$2" || { rm -rf "$2"; return 1; }
+}
+
+# For option parsing: "--flag value" with the value missing would otherwise loop forever.
+need_value() { [ $# -ge 2 ] || die "$1 needs a value"; }
 
 # Turns any text into a safe file name: "Schedule I" -> "schedule-i".
 slugify() {
@@ -248,7 +256,8 @@ apply_preset() { # bottle preset
 bottle_dir()    { printf '%s/%s' "$BOTTLES" "$1"; }
 bottle_prefix() { printf '%s/%s/prefix' "$BOTTLES" "$1"; }
 bottle_conf()   { printf '%s/%s/bottle.conf' "$BOTTLES" "$1"; }
-bottle_exists() { [ -d "$(bottle_prefix "$1")/drive_c" ]; }
+bottle_name_ok() { case "$1" in ""|*/*|.*) return 1 ;; esac; }
+bottle_exists() { bottle_name_ok "$1" && [ -d "$(bottle_prefix "$1")/drive_c" ]; }
 
 graphics_engine() { # graphics-setting -> engine
   case "$1" in
@@ -300,8 +309,12 @@ apply_bottle_registry() { # bottle (WINE, WINESERVER and WINEPREFIX already set)
   [ -d "$WINEPREFIX/drive_c" ] || return 0
   reg="$WINEPREFIX/drive_c/burrow-settings.reg"
   bottle_registry "$1" > "$reg"
-  "$WINE" reg import 'C:\burrow-settings.reg' >/dev/null 2>&1 || warn "Wine couldn't apply some settings to '$1'"
-  "$WINESERVER" -w 2>/dev/null
+  if ! "$WINE" reg import 'C:\burrow-settings.reg' >/dev/null 2>&1; then
+    rm -f "$reg"; warn "Wine couldn't apply some settings to '$1'; Burrow tries again next start"; return 0
+  fi
+  # Waiting lets wineserver save the registry, but while something runs in the bottle it would
+  # wait for that to quit; the running wineserver already has the new settings.
+  bottle_has_programs "$1" || "$WINESERVER" -w 2>/dev/null
   rm -f "$reg"
   conf_set "$conf" reg_applied "$want"
 }
@@ -358,7 +371,8 @@ use_bottle() { # bottle [graphics] [app-id]
   # A bottle that switched engines needs its system folder refreshed (DXMT's winemetal.dll
   # is copied into system32 by wineboot).
   local conf; conf=$(bottle_conf "$bottle")
-  if [ "$(conf_get "$conf" last_engine 2>/dev/null)" != "$engine" ] && [ -d "$WINEPREFIX/drive_c" ]; then
+  # While programs run in the bottle that would wait for them to quit, so it waits for a quiet start.
+  if [ "$(conf_get "$conf" last_engine 2>/dev/null)" != "$engine" ] && [ -d "$WINEPREFIX/drive_c" ] && ! bottle_has_programs "$bottle"; then
     "$WINE" wineboot -u >/dev/null 2>&1
     "$WINESERVER" -w 2>/dev/null
     conf_set "$conf" last_engine "$engine"
@@ -370,7 +384,7 @@ use_bottle() { # bottle [graphics] [app-id]
 new_log() { # name -> log path (keeps the newest 20 per name)
   mkdir -p "$LOGS"
   local base; base=$(slugify "$1")
-  ls -1t "$LOGS/$base"-*.log 2>/dev/null | tail -n +20 | while IFS= read -r old; do rm -f "$old"; done
+  ls -1t "$LOGS/$base"-[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]-[0-9][0-9][0-9][0-9][0-9][0-9].log 2>/dev/null | tail -n +20 | while IFS= read -r old; do rm -f "$old"; done
   printf '%s/%s-%s.log' "$LOGS" "$base" "$(date +%Y%m%d-%H%M%S)"
 }
 
@@ -402,6 +416,20 @@ stop_bottle() { ( bottle_env "$1" && "$WINESERVER" -k ) >/dev/null 2>&1; return 
 
 # True when Wine programs are running in the bottle.
 bottle_busy() { running_procs | cut -f1 | grep -qxF "$1"; }
+# Like bottle_busy, but not counting Wine's own background processes, which stay a few seconds
+# after every Wine command.
+bottle_has_programs() {
+  # Filtered in bash: an awk or grep given these names would itself look like a Wine process.
+  local b name rest
+  while IFS="$(printf '\t')" read -r b name rest; do
+    [ "$b" = "$1" ] || continue
+    case "$name" in
+      "Wine (system)"|services.exe|winedevice.exe|plugplay.exe|svchost.exe|rpcss.exe|explorer.exe|conhost.exe|start.exe|wineboot.exe|rundll32.exe) ;;
+      *) return 0 ;;
+    esac
+  done < <(running_procs)
+  return 1
+}
 
 cmd_bottle() {
   local sub="${1:-list}"; shift || true
@@ -409,7 +437,7 @@ cmd_bottle() {
     new|create)
       local name="" preset=""
       while [ $# -gt 0 ]; do
-        case "$1" in --preset) preset="${2:-}"; shift 2 ;; *) name="$1"; shift ;; esac
+        case "$1" in --preset) need_value "$@"; preset="$2"; shift 2 ;; *) name="$1"; shift ;; esac
       done
       cmd_bottle_create "$name" "$preset" ;;
     list|ls)
@@ -429,6 +457,7 @@ cmd_bottle() {
       done ;;
     delete|rm)
       local name="${1:-}"; [ -n "$name" ] || die "which bottle?"
+      bottle_name_ok "$name" || die "no bottle named '$name'"
       bottle_exists "$name" || [ -d "$(bottle_dir "$name")" ] || die "no bottle named '$name'"
       if [ "${2:-}" != "--yes" ]; then
         printf 'Delete bottle %s and everything installed in it? Type its name to confirm: ' "$name"
@@ -461,7 +490,7 @@ cmd_settings() {
   local bottle="" app="" plain=0 rest=()
   while [ $# -gt 0 ]; do
     case "$1" in
-      --app) app="${2:-}"; shift 2 ;;
+      --app) need_value "$@"; app="$2"; shift 2 ;;
       --plain) plain=1; shift ;;
       --list) settings_list; return 0 ;;
       *) rest+=("$1"); shift ;;
@@ -802,6 +831,8 @@ cmd_setup() {
 # driver (and a few DLLs games trip over) is rebuilt from the matching Wine source with the
 # patches in engine/wine-patches (from Neutron, MIT; the patches are LGPL like Wine). Only
 # those files are compiled, then DXMT's DLLs are laid over a clone of the stock engine.
+turbo_assemble_failed() { rm -rf "$1"; die "couldn't assemble the turbo engine (see the error above)"; }
+
 cmd_turbo() {
   is_mac || [ "${BURROW_TURBO_ANYWHERE:-0}" = 1 ] || die "turbo graphics is built on the Mac itself"
   engine_ok "$STOCK_ENGINE" || cmd_setup
@@ -847,20 +878,21 @@ cmd_turbo() {
     [ -f "$CACHE/turbo/wine-$version.tar.xz" ] && [ ! -f "$work/wine-$version.tar.xz" ] && mv "$CACHE/turbo/wine-$version.tar.xz" "$work/"
     rm -rf "${CACHE:?}/turbo"
   fi
-  local applied="$src/.burrow-patches"
-  if [ -d "$src" ] && [ ! -f "$applied" ]; then rm -rf "$src"; fi
+  # The source tree is reused only when exactly this set of patches applied cleanly to it; a
+  # half-applied or changed patch set starts again from the (cached) source archive.
+  local applied="$src/.burrow-patches" want p name
+  want=$(for p in "$patches"/*.patch; do printf '%s %s\n' "$(basename "$p")" "$(cksum < "$p" | awk '{print $1}')"; done)
+  if [ -d "$src" ] && [ "$(cat "$applied" 2>/dev/null)" != "$want" ]; then rm -rf "$src"; fi
   if [ ! -d "$src" ]; then
     [ -f "$work/wine-$version.tar.xz" ] || { step "Downloading the Wine $version source…"; download "https://dl.winehq.org/wine/source/$series/wine-$version.tar.xz" "$work/wine-$version.tar.xz" || die "couldn't download the Wine source"; }
-    tar -xJf "$work/wine-$version.tar.xz" -C "$work" || die "couldn't unpack the Wine source"
-    : > "$applied"
+    tar -xJf "$work/wine-$version.tar.xz" -C "$work" || { rm -rf "$src" "$work/wine-$version.tar.xz"; die "couldn't unpack the Wine source (it'll download again next time)"; }
+    for p in "$patches"/*.patch; do
+      name=$(basename "$p")
+      (cd "$src" && patch -p1 --forward --quiet < "$p") \
+        || { rm -rf "$src"; die "patch $name doesn't fit Wine $version (the patches were tested on 11.18)"; }
+    done
+    printf '%s\n' "$want" > "$applied"
   fi
-  local p name
-  for p in "$patches"/*.patch; do
-    name=$(basename "$p")
-    grep -qx "$name" "$applied" && continue
-    (cd "$src" && patch -p1 --forward --quiet < "$p") || die "patch $name doesn't fit Wine $version (the patches were tested on 11.18)"
-    echo "$name" >> "$applied"
-  done
 
   mkdir -p "$build"
   export MACOSX_DEPLOYMENT_TARGET=10.15
@@ -886,11 +918,11 @@ cmd_turbo() {
   step "Assembling the turbo engine…"
   local out; out=$(engine_root "$TURBO_ENGINE")
   rm -rf "$out.new"; clone_tree "$stock" "$out.new" || die "couldn't copy the engine"
-  cp "$build/dlls/winemac.drv/winemac.so" "$out.new/lib/wine/x86_64-unix/winemac.so"
-  x86_64-w64-mingw32-strip -o "$out.new/lib/wine/x86_64-windows/mfreadwrite.dll" "$build/dlls/mfreadwrite/x86_64-windows/mfreadwrite.dll"
+  cp "$build/dlls/winemac.drv/winemac.so" "$out.new/lib/wine/x86_64-unix/winemac.so" || turbo_assemble_failed "$out.new"
+  x86_64-w64-mingw32-strip -o "$out.new/lib/wine/x86_64-windows/mfreadwrite.dll" "$build/dlls/mfreadwrite/x86_64-windows/mfreadwrite.dll" || turbo_assemble_failed "$out.new"
   for n in $pe_dlls; do
-    i686-w64-mingw32-strip -o "$out.new/lib/wine/i386-windows/$n.dll" "$build/dlls/$n/i386-windows/$n.dll"
-    x86_64-w64-mingw32-strip -o "$out.new/lib/wine/x86_64-windows/$n.dll" "$build/dlls/$n/x86_64-windows/$n.dll"
+    i686-w64-mingw32-strip -o "$out.new/lib/wine/i386-windows/$n.dll" "$build/dlls/$n/i386-windows/$n.dll" || turbo_assemble_failed "$out.new"
+    x86_64-w64-mingw32-strip -o "$out.new/lib/wine/x86_64-windows/$n.dll" "$build/dlls/$n/x86_64-windows/$n.dll" || turbo_assemble_failed "$out.new"
   done
   overlay_dxmt "$out.new"
   rm -rf "$out"; mv "$out.new" "$out"
@@ -922,33 +954,40 @@ overlay_dxmt() { # engine-root
 lib_file() { printf '%s/%s.app.conf' "$LIBRARY" "$1"; }
 
 # Adds a program to the library. target is a Windows path (C:\...), a .lnk or .exe in the bottle.
-# The same name in the same bottle replaces the old entry (a reinstall); the same name in
-# another bottle gets its own id ("name-2") so neither hides the other.
-lib_add() { # name bottle target [args]
-  local name="$1" bottle="$2" target="$3" args="${4:-}" id f n=2
-  id=$(slugify "$name"); [ -n "$id" ] || id="app"
-  f=$(lib_file "$id")
-  if [ -f "$f" ] && [ "$(conf_get "$f" bottle)" != "$bottle" ]; then
-    while [ -f "$(lib_file "$id-$n")" ] && [ "$(conf_get "$(lib_file "$id-$n")" bottle)" != "$bottle" ]; do n=$((n + 1)); done
-    id="$id-$n"; f=$(lib_file "$id")
-  fi
+# The same name in the same bottle replaces the old entry (a reinstall) and keeps its per-app
+# settings; anything else whose name makes the same id (another bottle, or names like "Doom" and
+# "DOOM!", or non-Latin names that all become "app") gets its own id ("name-2") so none hides another.
+lib_add() { # name bottle target [args] [steam-appid]
+  local name="$1" bottle="$2" target="$3" args="${4:-}" appid="${5:-}" base id f n=2
+  base=$(slugify "$name"); [ -n "$base" ] || base="app"
+  id="$base"; f=$(lib_file "$id")
+  # Steam games are told apart by app id too: two games can have the same name.
+  while [ -f "$f" ] && { [ "$(conf_get "$f" bottle)" != "$bottle" ] || [ "$(conf_get "$f" name)" != "$name" ] \
+      || [ "$(conf_get "$f" steam_appid 2>/dev/null)" != "$appid" ]; }; do
+    id="$base-$n"; f=$(lib_file "$id"); n=$((n + 1))
+  done
   mkdir -p "$LIBRARY"
-  { printf 'name=%s\n' "$name"; printf 'bottle=%s\n' "$bottle"; printf 'target=%s\n' "$target"
-    printf 'args=%s\n' "$args"; printf 'graphics=auto\n'; } > "$f"
+  if [ -f "$f" ]; then
+    conf_set "$f" target "$target"; conf_set "$f" args "$args"
+  else
+    { printf 'name=%s\n' "$name"; printf 'bottle=%s\n' "$bottle"; printf 'target=%s\n' "$target"
+      printf 'args=%s\n' "$args"; printf 'graphics=auto\n'; [ -z "$appid" ] || printf 'steam_appid=%s\n' "$appid"; } > "$f"
+  fi
   printf '%s' "$id"
 }
 
-# Finds an app by id or by name (case-insensitive).
+# Finds an app by id, then by its exact name (case-insensitive), then by the id its name makes.
 lib_find() {
-  local q="$1" f id
-  [ -f "$(lib_file "$q")" ] && { printf '%s' "$q"; return 0; }
-  id=$(slugify "$q"); [ -f "$(lib_file "$id")" ] && { printf '%s' "$id"; return 0; }
+  local q="$1" f id lq
+  case "$q" in */*|"") ;; *) [ -f "$(lib_file "$q")" ] && { printf '%s' "$q"; return 0; } ;; esac
+  lq=$(printf '%s' "$q" | tr '[:upper:]' '[:lower:]')
   for f in "$LIBRARY"/*.app.conf; do
     [ -f "$f" ] || continue
-    if [ "$(conf_get "$f" name | tr '[:upper:]' '[:lower:]')" = "$(printf '%s' "$q" | tr '[:upper:]' '[:lower:]')" ]; then
+    if [ "$(conf_get "$f" name | tr '[:upper:]' '[:lower:]')" = "$lq" ]; then
       basename "$f" .app.conf; return 0
     fi
   done
+  id=$(slugify "$q"); [ -n "$id" ] && [ -f "$(lib_file "$id")" ] && { printf '%s' "$id"; return 0; }
   return 1
 }
 
@@ -987,9 +1026,9 @@ cmd_install() { # installer [--bottle B] [--name N] [--preset P]
   local installer="" bottle="" name="" preset=""
   while [ $# -gt 0 ]; do
     case "$1" in
-      --bottle) bottle="${2:-}"; shift 2 ;;
-      --name) name="${2:-}"; shift 2 ;;
-      --preset) preset="${2:-}"; shift 2 ;;
+      --bottle) need_value "$@"; bottle="$2"; shift 2 ;;
+      --name) need_value "$@"; name="$2"; shift 2 ;;
+      --preset) need_value "$@"; preset="$2"; shift 2 ;;
       *) installer="$1"; shift ;;
     esac
   done
@@ -1001,6 +1040,8 @@ cmd_install() { # installer [--bottle B] [--name N] [--preset P]
       installer="$CACHE/downloads/$fname" ;;
   esac
   [ -f "$installer" ] || die "no such file: $installer"
+  # The installer runs from its own folder, so a relative path has to be made absolute first.
+  installer="$(cd "$(dirname "$installer")" && pwd)/$(basename "$installer")"
   local base; base=$(basename "$installer"); base="${base%.*}"
   [ -n "$bottle" ] || bottle="${name:-$base}"
   if ! bottle_exists "$bottle"; then cmd_bottle_create "$bottle" "$preset"
@@ -1042,9 +1083,9 @@ cmd_add() { # name --bottle B --exe PATH [--args A]
   shift || true
   while [ $# -gt 0 ]; do
     case "$1" in
-      --bottle) bottle="${2:-}"; shift 2 ;;
-      --exe) exe="${2:-}"; shift 2 ;;
-      --args) args="${2:-}"; shift 2 ;;
+      --bottle) need_value "$@"; bottle="$2"; shift 2 ;;
+      --exe) need_value "$@"; exe="$2"; shift 2 ;;
+      --args) need_value "$@"; args="$2"; shift 2 ;;
       *) die "unknown option $1" ;;
     esac
   done
@@ -1074,12 +1115,12 @@ cmd_remove() {
 
 cmd_launch() { # app [--graphics G] [-- extra args]
   local q="${1:-}"; shift || true
-  local graphics="" extra=""
+  local graphics="" extra=()
   while [ $# -gt 0 ]; do
     case "$1" in
-      --graphics) graphics="${2:-}"; shift 2 ;;
-      --) shift; extra="$*"; break ;;
-      *) extra="$extra $1"; shift ;;
+      --graphics) need_value "$@"; graphics="$2"; shift 2 ;;
+      --) shift; extra+=("$@"); break ;;
+      *) extra+=("$1"); shift ;;
     esac
   done
   local id f; id=$(lib_find "$q") || die "no app called '$q' (see: burrow apps)"
@@ -1096,9 +1137,29 @@ cmd_launch() { # app [--graphics G] [-- extra args]
     local v; for v in $BURROW_USER_ENV; do printf '%s=%s\n' "$v" "$(printenv "$v")"; done; } > "$log"
   step "Starting $name ($BOTTLE_ENGINE)…  log: $log"
   # `start /wait` follows .lnk shortcuts and sets the program's own folder as the working dir.
-  # shellcheck disable=SC2086
-  "$WINE" start /wait "$target" $args $extra >>"$log" 2>&1 &
+  split_args "$args"
+  "$WINE" start /wait "$target" ${SPLIT_ARGS[@]+"${SPLIT_ARGS[@]}"} ${extra[@]+"${extra[@]}"} >>"$log" 2>&1 &
   [ "${BURROW_FOREGROUND:-0}" = 1 ] && wait
+  return 0
+}
+
+# Splits saved launch options the way Windows does: spaces separate, "double quotes" group,
+# and nothing is expanded (no * globbing, no $variables). Result in SPLIT_ARGS.
+split_args() { # text
+  SPLIT_ARGS=()
+  local s="$1" cur="" inq=0 have=0 c i tab; tab=$(printf '\t')
+  for ((i = 0; i < ${#s}; i++)); do
+    c="${s:i:1}"
+    if [ "$c" = '"' ]; then
+      inq=$((1 - inq)); have=1
+    elif [ "$inq" = 0 ] && { [ "$c" = " " ] || [ "$c" = "$tab" ]; }; then
+      [ "$have" = 1 ] && SPLIT_ARGS+=("$cur")
+      cur=""; have=0
+    else
+      cur="$cur$c"; have=1
+    fi
+  done
+  [ "$have" = 1 ] && SPLIT_ARGS+=("$cur")
   return 0
 }
 
@@ -1162,7 +1223,16 @@ cmd_steam_install() {
 
 steam_exe_win() { if [ -f "$(steam_root)/Steam.exe" ]; then printf '%s\\Steam.exe' "$STEAM_DIR_WIN"; else printf '%s\\steam.exe' "$STEAM_DIR_WIN"; fi; }
 
-steam_running() { [ -f "$BOTTLES/$STEAM_BOTTLE/.steam-running" ] && kill -0 "$(cat "$BOTTLES/$STEAM_BOTTLE/.steam-running")" 2>/dev/null; }
+# The PID is Burrow's own Steam subshell. After a crash or restart the file can outlive it and the
+# number can belong to something else, so the process must still be Burrow, or the file is stale.
+steam_running() {
+  local f="$BOTTLES/$STEAM_BOTTLE/.steam-running" pid
+  [ -f "$f" ] || return 1
+  pid=$(cat "$f" 2>/dev/null)
+  case "$pid" in ""|*[!0-9]*) rm -f "$f"; return 1 ;; esac
+  if kill -0 "$pid" 2>/dev/null && ps -p "$pid" -o command= 2>/dev/null | grep -q burrow; then return 0; fi
+  rm -f "$f"; return 1
+}
 
 cmd_steam_open() { # [extra steam args]
   cmd_steam_install
@@ -1217,7 +1287,7 @@ $real"
       [ -f "$f" ] || continue
       local id name dir
       id=$(sed -n 's/^[[:space:]]*"appid"[[:space:]]*"\([0-9]*\)".*/\1/p' "$f" | head -1)
-      name=$(sed -n 's/^[[:space:]]*"name"[[:space:]]*"\(.*\)"[[:space:]]*$/\1/p' "$f" | head -1)
+      name=$(sed -n 's/^[[:space:]]*"name"[[:space:]]*"\(.*\)"[[:space:]]*$/\1/p' "$f" | head -1 | sed -e 's/\\"/"/g' -e 's/\\\\/\\/g')
       dir=$(sed -n 's/^[[:space:]]*"installdir"[[:space:]]*"\(.*\)"[[:space:]]*$/\1/p' "$f" | head -1)
       # Skip Steam's own runtimes (Steamworks redistributables, Proton, etc.).
       case "$id" in 228980|1070560|1391110|1628350) continue ;; esac
@@ -1247,8 +1317,7 @@ cmd_steam_sync() {
   while IFS="$(printf '\t')" read -r id name dir; do
     [ -n "$id" ] || continue
     grep -qxF "steam_appid=$id" "$LIBRARY"/*.app.conf 2>/dev/null && continue
-    local lid; lid=$(lib_add "$name" "$STEAM_BOTTLE" "steam://rungameid/$id")
-    conf_set "$(lib_file "$lid")" steam_appid "$id"
+    lib_add "$name" "$STEAM_BOTTLE" "steam://rungameid/$id" "" "$id" >/dev/null
     ok "Added $name"; added=$((added + 1))
   done < <(printf '%s\n' "$out")
   [ "$added" -gt 0 ] || say "Your Steam games are already in the library."
@@ -1300,6 +1369,9 @@ cmd_shortcut() { # app
 cmd_app() { # builds Burrow.app: the windowed app, or the simple menu if Swift isn't available
   is_mac || die "Burrow.app is made on the Mac"
   local dest="${1:-$HOME/Applications/Burrow.app}"
+  # The old app at dest is replaced, so dest must be an app, never a folder like ~/Applications.
+  case "$dest" in *.app|*.app/) dest="${dest%/}" ;; *) die "give the app's path, ending in .app (e.g. ~/Applications/Burrow.app)" ;; esac
+  [ ! -e "$dest" ] || [ -d "$dest/Contents" ] || die "$dest exists and isn't an app; not replacing it"
   mkdir -p "$(dirname "$dest")"
   if [ "${BURROW_MENU_APP:-0}" != 1 ] && build_window_app "$dest"; then
     ok "Made $dest"

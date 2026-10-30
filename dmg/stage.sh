@@ -19,6 +19,11 @@ OUT="${1:?usage: stage.sh <output-folder>}"
 VERSION="$(sed -n 's/^BURROW_VERSION="\(.*\)"$/\1/p' "${ROOT}/bin/burrow")"
 [[ -n "${VERSION}" ]] || { echo "couldn't read BURROW_VERSION from bin/burrow" >&2; exit 1; }
 
+# OUT is replaced, so only an empty folder or an earlier stage may be there.
+if [[ -e "${OUT}" && -n "$(ls -A "${OUT}" 2>/dev/null)" && ! -f "${OUT}/Sources/BurrowApp.swift" ]]; then
+    echo "${OUT} isn't empty; give stage.sh a new folder" >&2
+    exit 1
+fi
 rm -rf "${OUT}"
 mkdir -p "${OUT}/Sources" "${OUT}/Resources/burrow-cli"
 cp "${ROOT}/app/BurrowApp.swift" "${OUT}/Sources/"

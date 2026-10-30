@@ -97,7 +97,19 @@ xattr -cr "${APP}" 2>/dev/null || true
 
 if [[ -n "${DEVELOPER_ID:-}" ]]; then
     info "Signing with ${DEVELOPER_ID}"
-    codesign --force --options runtime --timestamp --sign "${DEVELOPER_ID}" \
+    # The hardened runtime blocks Apple Events unless entitled; Burrow uses them to open Terminal
+    # for the Homebrew install.
+    ENT="${WORK}/entitlements.plist"
+    cat > "${ENT}" <<'PLIST'
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>com.apple.security.automation.apple-events</key><true/>
+</dict>
+</plist>
+PLIST
+    codesign --force --options runtime --timestamp --entitlements "${ENT}" --sign "${DEVELOPER_ID}" \
         --identifier "${BUNDLE_ID}" "${APP}" || die "codesign failed."
 else
     # Ad-hoc signature: required on Apple Silicon, and it seals the bundle.
