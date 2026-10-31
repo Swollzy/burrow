@@ -24,6 +24,11 @@ done
 cp "$work/fakeapp.exe" "$work/fake-setup.exe"
 
 "$burrow" setup >/dev/null 2>&1 || true   # downloads DXMT; fine if offline
+# Downloads shown in Burrow's window: progress every 10%, not a redrawn bar per line.
+mkdir -p "$work/dx/dxmt-v9.99/x86_64-windows" && head -c 3000000 /dev/urandom > "$work/dx/dxmt-v9.99/x86_64-windows/d3d11.dll"
+tar -czf "$work/dx.tar.gz" -C "$work/dx" dxmt-v9.99
+BURROW_DXMT_VERSION=v9.99 BURROW_DXMT_URL="file://$work/dx.tar.gz" "$burrow" setup > "$work/dl.txt" 2>&1
+check "download progress suits a log window" '[ -d "$BURROW_HOME/runtimes/dxmt-v9.99/x86_64-windows" ] && ! grep -q "#" "$work/dl.txt" && [ "$(grep -c "%" "$work/dl.txt")" -le 11 ]'
 "$burrow" bottle new Games >/dev/null
 check "bottle created" '[ -d "$BURROW_HOME/bottles/Games/prefix/drive_c" ]'
 check "bottle reports Windows 10" 'grep -q "\"Version\"=\"win10\"" "$BURROW_HOME/bottles/Games/prefix/user.reg"'
@@ -54,6 +59,35 @@ check "a program outside the bottle is reached through Z:" 'grep -q "^target=Z:.
 "$burrow" add "Direct" --bottle Games --exe 'C:\Program Files\Fake App\Fake App.exe' --args "--hello" >/dev/null
 rm -f "$ran"; "$burrow" launch Direct >/dev/null 2>&1
 check "manual add + launch with args" 'tr -d "\000" < "$ran" | grep -q -- "--hello"'
+"$burrow" add "Quoted" --bottle Games --exe 'C:\Program Files\Fake App\Fake App.exe' --args '-config "C:\My Games\x.ini" *' >/dev/null
+rm -f "$ran"; (cd "$here" && "$burrow" launch Quoted >/dev/null 2>&1)
+check "launch options keep quoted paths and don't glob" 'c=$(tr -d "\000" < "$ran" | grep "^cmd="); case "$c" in *"\"C:\\My Games\\x.ini\""*) ;; *) false ;; esac && case "$c" in *run-tests.sh*) false ;; esac'
+"$burrow" remove Quoted >/dev/null
+
+# A relative installer path still runs the installer (it starts from its own folder).
+mkdir -p "$work/dl/sub"; cp "$work/fakeapp.exe" "$work/dl/sub/other-setup.exe"
+rm -f "$BURROW_HOME/bottles/Games/prefix/drive_c/Program Files/Fake App/Fake App.exe"
+(cd "$work/dl" && "$burrow" install sub/other-setup.exe --bottle Games >/dev/null 2>&1)
+check "install with a relative path runs the installer" '[ -f "$BURROW_HOME/bottles/Games/prefix/drive_c/Program Files/Fake App/Fake App.exe" ]'
+
+# Old logs of other apps whose names start the same way are left alone.
+touch -t 202001010000 "$BURROW_HOME/logs/fake-app-x-20200101-000000.log"
+for i in 01 02 03 04 05 06 07 08 09 10 11 12 13 14 15 16 17 18 19 20 21; do touch -t "2021010100$i" "$BURROW_HOME/logs/fake-app-20210101-0000$i.log"; done
+"$burrow" launch "fake app" >/dev/null 2>&1
+check "log cleanup keeps other apps' logs" '[ -f "$BURROW_HOME/logs/fake-app-x-20200101-000000.log" ] && [ "$(ls "$BURROW_HOME"/logs/fake-app-2*.log | wc -l)" -le 20 ]'
+
+# Names that make the same id must not overwrite each other; a reinstall keeps app settings.
+"$burrow" add "東方" --bottle Games --exe 'C:\a.exe' >/dev/null
+"$burrow" add "ゼルダ" --bottle Games --exe 'C:\b.exe' >/dev/null
+"$burrow" add "Doom" --bottle Games --exe 'C:\d.exe' >/dev/null
+"$burrow" add "DOOM!" --bottle Games --exe 'C:\d2.exe' >/dev/null
+check "non-Latin names each get their own entry" '"$burrow" apps --plain | grep -q "	東方	" && "$burrow" apps --plain | grep -q "	ゼルダ	"'
+check "look-alike names each get their own entry" '[ "$("$burrow" apps --plain | cut -f2 | grep -ci "^doom!*$")" = 2 ]'
+"$burrow" settings --app "DOOM!" cpu_cores=3 >/dev/null
+"$burrow" add "DOOM!" --bottle Games --exe 'C:\d3.exe' >/dev/null
+check "re-adding an app keeps its settings and takes the new target" 'f="$BURROW_HOME/library/$("$burrow" apps --plain | awk -F"\t" "\$2==\"DOOM!\"{print \$1}").app.conf"; grep -qx "cpu_cores=3" "$f" && grep -qxF "target=C:\\d3.exe" "$f"'
+for n in "東方" "ゼルダ" "Doom" "DOOM!"; do "$burrow" remove "$n" >/dev/null; done
+check "removing by name removes the right ones" '! "$burrow" apps --plain | grep -qiE "	(東方|ゼルダ|doom!?)	"'
 
 # Steam, with stand-ins for Steam.exe and steamwebhelper.exe.
 "$burrow" bottle new Steam >/dev/null
@@ -125,9 +159,19 @@ check "library launch of a Steam game goes through Steam" 'tr -d "\000" < "$st/s
 
 check "apps --plain is id<TAB>name<TAB>bottle<TAB>appid" '"$burrow" apps --plain | grep -q "^schedule-i	Schedule I	Steam	3164500$"'
 check "steam games --plain" '"$burrow" steam games --plain | grep -q "^1111111	Data Center$"'
+# Two Steam games with the same name, a non-Latin name, and a name with escaped quotes.
+for g in "2222221 Prey" "2222222 Prey" "2222223 原神" '2222224 The \"Quoted\" Game'; do
+  printf '"AppState"\n{\n\t"appid"\t\t"%s"\n\t"name"\t\t"%s"\n}\n' "${g%% *}" "${g#* }" > "$sroot/steamapps/appmanifest_${g%% *}.acf"
+done
+"$burrow" steam sync >/dev/null; "$burrow" steam sync >/dev/null
+check "steam sync keeps same-name games apart" '[ "$("$burrow" apps --plain | grep -c "	Prey	Steam	222222[12]$")" = 2 ]'
+check "steam sync keeps non-Latin names" '"$burrow" apps --plain | grep -q "	原神	Steam	2222223$"'
+check "steam names lose VDF escapes" '"$burrow" apps --plain | grep -qF "	The \"Quoted\" Game	Steam	2222224"'
+rm -f "$sroot"/steamapps/appmanifest_222222[1-4].acf
 mkdir -p "$BURROW_HOME/runtimes/dxmt-v0.80/x86_64-windows" "$sroot/steamapps/common/Schedule I"
 head -c 2000000 /dev/zero > "$sroot/steamapps/common/Schedule I/game.bin"   # stands in for the DXMT download
 check "status line" '"$burrow" status | grep -q "^setup=1 turbo=0 steam=1 clt=0 "'
+check "status reports the hardware and macOS version" '"$burrow" status | grep -q " arm=0 rosetta=1 macos=0$"'
 check "usage lists bottles, games and free space" 'out=$("$burrow" usage --plain); printf "%s" "$out" | grep -q "^DISK	bottle	Steam	" && printf "%s" "$out" | grep -q "^DISK	game	Schedule I	" && printf "%s" "$out" | grep -q "^FREE	[0-9]"'
 "$burrow" run Games notepad >/dev/null 2>&1 &
 for _ in 1 2 3 4 5 6 7 8 9 10; do "$burrow" usage --ram --plain | grep -qi "notepad.exe" && break; sleep 1; done
@@ -186,6 +230,22 @@ for _ in 1 2 3 4 5 6 7 8 9 10; do ps -axww -o command= | grep -q "[d]esktop=Burr
 check "desktop opens a Windows desktop window" 'ps -axww -o command= | grep -q "[d]esktop=Burrow,800x600"'
 "$burrow" kill Games >/dev/null 2>&1
 
+# Bad input fails fast instead of hanging or reaching outside Burrow's folders.
+hung=""
+for a in "bottle new Nope --preset" "install x.exe --bottle" "launch x --graphics" "settings --app"; do
+  # shellcheck disable=SC2086  # $a is several words on purpose
+  timeout 10 "$burrow" $a 2>&1 | grep -q "needs a value" || hung="$hung [$a]"
+done
+check "a flag without its value fails instead of hanging" '[ -z "$hung" ]'
+check "bottle delete refuses paths" '! "$burrow" bottle delete ../library --yes 2>/dev/null && [ -d "$BURROW_HOME/library" ]'
+
+# A leftover Steam PID file from a crash or restart doesn't stop Steam from opening properly.
+sleep 60 & stale=$!
+echo "$stale" > "$BURROW_HOME/bottles/Steam/.steam-running"
+rm -f "$st/steam.txt"; "$burrow" steam >/dev/null 2>&1
+check "a stale Steam PID file is ignored" 'tr -d "\000" < "$st/steam.txt" 2>/dev/null | grep -q -- "-noverifyfiles"'
+kill "$stale" 2>/dev/null
+
 # Same program name in two bottles: both stay in the library.
 "$burrow" bottle new Other >/dev/null
 "$burrow" add "Direct" --bottle Other --exe 'C:\windows\notepad.exe' >/dev/null
@@ -196,8 +256,76 @@ check "re-adding in the same bottle replaces its entry" '[ ! -f "$BURROW_HOME/li
 check "bottle delete keeps other bottles' apps" '[ ! -f "$BURROW_HOME/library/direct-2.app.conf" ] && [ -f "$BURROW_HOME/library/direct.app.conf" ]'
 "$burrow" remove Direct >/dev/null
 check "remove" '! "$burrow" apps | grep -q Direct'
+mkdir -p "$BURROW_SHORTCUTS/Fake App.app/Contents"
 "$burrow" bottle delete Games --yes >/dev/null
 check "bottle delete removes its apps" '! "$burrow" apps | grep -q "Fake App" && [ ! -d "$BURROW_HOME/bottles/Games" ]'
+check "bottle delete removes its apps' Mac shortcuts" '[ ! -d "$BURROW_SHORTCUTS/Fake App.app" ]'
+
+# Cleanup after an update: what older versions left goes, everything of the user's stays.
+for _ in $(seq 1 20); do "$burrow" usage --ram --plain | grep -q "^PROC" || break; sleep 1; done
+h="$BURROW_HOME"
+mkdir -p "$h/engines/wine-10.0/bin" "$h/engines/wine-11.18/bin" "$h/engines/wine-11.18-turbo/bin" \
+  "$h/runtimes/dxmt-v0.70/x86_64-windows" "$h/runtimes/dxmt-v0.80/x86_64-windows" "$h/app.new" "$h/cache/turbo"
+touch "$h/cache/wine-devel-10.0-osx64.tar.xz" "$h/cache/wine-devel-11.18-osx64.tar.xz" \
+  "$h/cache/dxmt-v0.70-builtin.tar.gz" "$h/cache/dxmt-v0.80-builtin.tar.gz" "$h/runtimes/winetricks-20230212" \
+  "$h/cache/half.part" "$h/logs/ancient-20200101-000000.log" "$h/logs/recent-20990101-000000.log"
+touch -t 202001010000 "$h/app.new" "$h/cache/half.part" "$h/logs/ancient-20200101-000000.log"
+(exit 0) & dead=$!; wait "$dead"
+touch "$h/library/x.app.conf.tmp.$dead" "$h/bottles/Tweak/bottle.conf.tmp.$dead"
+"$burrow" cleanup --dry-run >/dev/null
+check "cleanup --dry-run changes nothing" '[ -d "$h/engines/wine-10.0" ] && [ -f "$h/cache/half.part" ]'
+"$burrow" cleanup > "$work/cleanup.txt" 2>&1
+check "cleanup removes old engines, downloads and half-finished files" '[ ! -e "$h/engines/wine-10.0" ] && [ ! -e "$h/runtimes/dxmt-v0.70" ] && [ ! -e "$h/runtimes/winetricks-20230212" ] && [ ! -e "$h/cache/wine-devel-10.0-osx64.tar.xz" ] && [ ! -e "$h/cache/dxmt-v0.70-builtin.tar.gz" ] && [ ! -e "$h/cache/turbo" ] && [ ! -e "$h/app.new" ] && [ ! -e "$h/cache/half.part" ] && [ ! -e "$h/library/x.app.conf.tmp.$dead" ] && [ ! -e "$h/bottles/Tweak/bottle.conf.tmp.$dead" ] && [ ! -e "$h/logs/ancient-20200101-000000.log" ]'
+check "cleanup keeps current engines, downloads, recent logs and the user's things" '[ -d "$h/engines/wine-11.18" ] && [ -d "$h/engines/wine-11.18-turbo" ] && [ -d "$h/runtimes/dxmt-v0.80" ] && [ -f "$h/cache/wine-devel-11.18-osx64.tar.xz" ] && [ -f "$h/cache/dxmt-v0.80-builtin.tar.gz" ] && [ -f "$h/logs/recent-20990101-000000.log" ] && [ -d "$h/bottles/Tweak/prefix/drive_c" ] && [ -d "$h/bottles/Steam/prefix/drive_c" ] && [ -n "$(ls "$h/library")" ]'
+check "cleanup says what it freed" 'grep -q "Freed .* Your bottles, games and settings" "$work/cleanup.txt"'
+mkdir -p "$h/engines/wine-9.0"
+check "cleanup --if-updated runs once per version" '[ "$(cat "$h/.burrow-version")" = "$("$burrow" version | cut -d" " -f2)" ] && "$burrow" cleanup --if-updated && [ -d "$h/engines/wine-9.0" ]'
+"$burrow" run Tweak notepad >/dev/null 2>&1 &
+for _ in 1 2 3 4 5 6 7 8 9 10; do "$burrow" usage --ram --plain | grep -qi "notepad.exe" && break; sleep 1; done
+"$burrow" cleanup >/dev/null 2>&1
+check "cleanup leaves engines alone while programs run" '[ -d "$h/engines/wine-9.0" ]'
+"$burrow" kill Tweak >/dev/null 2>&1
+
+# Without Apple Silicon, turbo (DXMT) is never used, even when it has been built.
+ln -sf "$WINEBIN" "$h/engines/wine-11.18-turbo/bin/wine"
+"$burrow" add T1 --bottle Tweak --exe 'C:\windows\notepad.exe' >/dev/null
+BURROW_FOREGROUND=0 "$burrow" launch T1 >/dev/null 2>&1; sleep 2; "$burrow" kill Tweak >/dev/null 2>&1
+lastlog=$(ls -t "$h"/logs/t1-*.log | head -1)
+check "without Apple Silicon, auto never picks turbo" 'head -1 "$lastlog" | grep -q " on wine-11.18$"'
+check "asking for turbo without Apple Silicon says why" '"$burrow" launch T1 --graphics turbo 2>&1 | grep -q "needs an Apple Silicon Mac"'
+check "turbo build refuses without Apple Silicon" 'BURROW_TURBO_ANYWHERE=0 "$burrow" turbo 2>&1 | grep -qE "Mac itself|Apple Silicon"'
+"$burrow" remove T1 >/dev/null
+rm -rf "$h/engines/wine-11.18" "$h/engines/wine-11.18-turbo" "$h/engines/wine-9.0"
+
+# A snapshot or copy right after a Wine command waits for Wine's background processes to go.
+WINEPREFIX="$h/bottles/Tweak/prefix" "$(dirname "$WINEBIN")/wineserver" -p 30 >/dev/null 2>&1
+check "snapshot waits out Wine's background processes" '"$burrow" snapshot save Tweak lingering >/dev/null 2>&1 && "$burrow" snapshot list Tweak --plain | grep -q "	lingering	"'
+
+# Uninstall: Burrow's own files go; bottles (games, saves), the library and snapshots stay unless
+# --everything. Never while Windows programs run.
+"$burrow" run Tweak notepad >/dev/null 2>&1 &
+for _ in 1 2 3 4 5 6 7 8 9 10; do "$burrow" usage --ram --plain | grep -qi "notepad.exe" && break; sleep 1; done
+check "uninstall waits while Windows programs run" '! HOME="$work/fakehome" "$burrow" uninstall --yes > "$work/un0.txt" 2>&1 && grep -q "still running in: Tweak" "$work/un0.txt" && [ -d "$h/bottles/Tweak/prefix" ] && [ -d "$h/runtimes" ]'
+"$burrow" kill Tweak >/dev/null 2>&1
+u="$work/uhome"; fh="$work/fakehome"
+mkdir -p "$u/engines/wine-11.18/bin" "$u/runtimes/dxmt-v0.80" "$u/cache/downloads" "$u/logs" "$u/app/bin" \
+  "$u/bottles/Keep/prefix/drive_c/saves" "$u/library" "$u/snapshots/Keep" "$work/ushort/Keep Game.app/Contents" \
+  "$work/ushort/Other.app" "$fh/.local/bin" "$fh/Library/Caches/Burrow/turbo"
+cp "$burrow" "$u/app/bin/burrow"
+printf 'name=Keep Game\nbottle=Keep\ntarget=C:\\x.exe\n' > "$u/library/keep-game.app.conf"
+ln -s "$u/app/bin/burrow" "$fh/.local/bin/burrow"
+printf 'export FOO=1\n\nexport PATH="$HOME/.local/bin:$PATH" # added by Burrow\n' > "$fh/.zprofile"
+touch "$u/.burrow-version" "$u/logs/a-20990101-000000.log"
+un() { HOME="$fh" BURROW_HOME="$u" BURROW_SHORTCUTS="$work/ushort" "$@"; }
+check "uninstall asks first, and refuses without --yes when it can't ask" '! un "$burrow" uninstall </dev/null >/dev/null 2>&1 && [ -d "$u/engines" ]'
+un "$burrow" uninstall --dry-run > "$work/un1.txt" 2>&1
+check "uninstall --dry-run lists what goes and removes nothing" 'grep -q "Wine:" "$work/un1.txt" && grep -q "would stay" "$work/un1.txt" && [ -d "$u/engines" ] && [ -L "$fh/.local/bin/burrow" ]'
+un "$u/app/bin/burrow" uninstall --yes > "$work/un2.txt" 2>&1   # the installed copy, removing itself
+check "uninstall removes Burrow's files" '[ ! -e "$u/engines" ] && [ ! -e "$u/runtimes" ] && [ ! -e "$u/cache" ] && [ ! -e "$u/logs" ] && [ ! -e "$u/app" ] && [ ! -e "$u/.burrow-version" ] && [ ! -e "$fh/Library/Caches/Burrow" ] && [ ! -e "$work/ushort/Keep Game.app" ]'
+check "uninstall keeps bottles, the library, snapshots and other apps" '[ -d "$u/bottles/Keep/prefix/drive_c/saves" ] && [ -f "$u/library/keep-game.app.conf" ] && [ -d "$u/snapshots/Keep" ] && [ -d "$work/ushort/Other.app" ] && grep -q "still in" "$work/un2.txt"'
+check "uninstall removes the burrow command and its PATH line, nothing else" '[ ! -e "$fh/.local/bin" ] && ! grep -q "added by Burrow" "$fh/.zprofile" && grep -q "^export FOO=1$" "$fh/.zprofile"'
+un "$burrow" uninstall --everything --yes > "$work/un3.txt" 2>&1
+check "uninstall --everything deletes bottles and games too" '[ ! -e "$u" ] && grep -q "with its bottles and games" "$work/un3.txt"'
 
 echo; echo "$pass passed, $fail failed"
 [ "$fail" = 0 ]
