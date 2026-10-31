@@ -9,8 +9,10 @@
 #   Resources/everything else   copied into Contents/Resources
 #
 # The app is built for Apple Silicon and Intel (one universal file) when the Command Line
-# Tools can do both, and ad-hoc signed. Set DEVELOPER_ID (and NOTARY_PROFILE) to sign and
-# notarize with a paid Apple Developer account instead; see README.md.
+# Tools can do both. Once "Set Up Signing.command" has run on this Mac, the app and the DMG
+# are signed with the Developer ID and notarized by Apple (signing.sh), so friends open it
+# with no warning. Without it the app is ad-hoc signed and friends use "Open Anyway" once.
+# See README.md.
 #
 # Keep this file plain ASCII and write variables as ${NAME}: macOS ships bash 3.2.
 
@@ -27,6 +29,8 @@ warn() { printf '    \033[33m%s\033[0m\n' "$*"; }
 die() { printf '    \033[31m%s\033[0m\n' "$*" >&2; exit 1; }
 
 [[ "$(uname)" == "Darwin" ]] || die "DMGs are made on a Mac."
+# shellcheck source=signing.sh
+. "${HERE}/signing.sh"
 PLIST="${SRC}/Resources/Info.plist"
 [[ -f "${PLIST}" ]] || die "No Resources/Info.plist in ${SRC}"
 plist_get() { /usr/libexec/PlistBuddy -c "Print :$1" "${PLIST}"; }
@@ -34,6 +38,17 @@ NAME="$(plist_get CFBundleExecutable)"
 VERSION="$(plist_get CFBundleShortVersionString)"
 BUNDLE_ID="$(plist_get CFBundleIdentifier)"
 MIN_OS="$(plist_get LSMinimumSystemVersion 2>/dev/null || echo 13.0)"
+
+if signing_load; then
+    info "Signing as ${SIGN_NAME}"
+    if [[ -n "${NOTARY_PROFILE}" ]]; then KIND="signed"; else
+        KIND="unsigned"
+        warn "No notary login saved, so Apple won't notarize this DMG. Double-click Set Up Signing.command to add it."
+    fi
+else
+    KIND="unsigned"
+fi
+NOTARY_LOG="${OUT}/${NAME}-notarize.log"
 
 WORK="$(mktemp -d)"
 DEVICE=""
@@ -95,8 +110,7 @@ done
 find "${APP}" -name .DS_Store -delete
 xattr -cr "${APP}" 2>/dev/null || true
 
-if [[ -n "${DEVELOPER_ID:-}" ]]; then
-    info "Signing with ${DEVELOPER_ID}"
+if [[ -n "${SIGN_HASH}" ]]; then
     # The hardened runtime blocks Apple Events unless entitled; Burrow uses them to open Terminal
     # for the Homebrew install.
     ENT="${WORK}/entitlements.plist"
@@ -109,8 +123,7 @@ if [[ -n "${DEVELOPER_ID:-}" ]]; then
 </dict>
 </plist>
 PLIST
-    codesign --force --options runtime --timestamp --entitlements "${ENT}" --sign "${DEVELOPER_ID}" \
-        --identifier "${BUNDLE_ID}" "${APP}" || die "codesign failed."
+    signing_sign_app "${APP}" "${BUNDLE_ID}" "${ENT}" || die "Signing with the Developer ID failed."
 else
     # Ad-hoc signature: required on Apple Silicon, and it seals the bundle.
     codesign --force --sign - --identifier "${BUNDLE_ID}" "${APP}" >/dev/null 2>&1 || die "codesign failed."
@@ -123,7 +136,7 @@ mkdir -p "${STAGE}/.background"
 cp -R "${APP}" "${STAGE}/"
 ln -s /Applications "${STAGE}/Applications"
 README="${HERE}/readme/${NAME}.txt"
-sed -e "s/{{NAME}}/${NAME}/g" -e "s/{{VERSION}}/${VERSION}/g" "${README}" > "${STAGE}/Read Me First.txt"
+sed -e "s/{{NAME}}/${NAME}/g" -e "s/{{VERSION}}/${VERSION}/g" "${README}" | signing_readme_filter "${KIND}" > "${STAGE}/Read Me First.txt"
 BG="${HERE}/art/${NAME}-bg.png"
 BG2X="${BG%.png}@2x.png"
 if [[ -f "${BG2X}" ]] && tiffutil -cathidpicheck "${BG}" "${BG2X}" -out "${STAGE}/.background/background.tiff" >/dev/null 2>&1; then
@@ -191,13 +204,22 @@ rm -f "${DMG}"
 hdiutil convert -quiet "${WORK}/rw.dmg" -format UDZO -imagekey zlib-level=9 -o "${DMG}" \
     || die "hdiutil convert failed."
 
-if [[ -n "${DEVELOPER_ID:-}" ]]; then
-    codesign --force --timestamp --sign "${DEVELOPER_ID}" "${DMG}" || die "Signing the DMG failed."
-    if [[ -n "${NOTARY_PROFILE:-}" ]]; then
-        info "Sending to Apple for notarizing (a few minutes)"
-        xcrun notarytool submit "${DMG}" --keychain-profile "${NOTARY_PROFILE}" --wait || die "Notarizing failed."
-        xcrun stapler staple "${DMG}" || die "Stapling failed."
+rm -f "${NOTARY_LOG}"
+if [[ -n "${SIGN_HASH}" ]]; then
+    codesign --force --timestamp --sign "${SIGN_HASH}" "${DMG}" || die "Signing the DMG failed."
+    if [[ "${KIND}" == "signed" ]]; then
+        info "Apple is checking it for malware (usually 1 to 5 minutes)"
+        if ! signing_notarize "${DMG}" "${NOTARY_LOG}"; then
+            # Not shared by mistake: its read-me says no warning, and friends would get one.
+            rm -f "${DMG}"
+            die "Apple didn't notarize ${NAME}. The reason is in ${NOTARY_LOG}; run this again, or send that file to Claude."
+        fi
     fi
 fi
 
 info "Made ${DMG} ($(du -h "${DMG}" | cut -f1 | tr -d ' '), ${ARCHS// / + })"
+if [[ "${KIND}" == "signed" ]]; then
+    info "Notarized by Apple: it opens on friends' Macs with no warning."
+else
+    info "Not notarized: friends do the one-time \"Open Anyway\" step its Read Me First explains."
+fi

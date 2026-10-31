@@ -33,6 +33,19 @@ if ! have_tools; then
     have_tools || { echo "The Command Line Tools still aren't installed. Install them, then run this again."; finish 1; }
 fi
 
+# Apple signing: once "Set Up Signing.command" has run, DMGs open on friends' Macs with no
+# warning. Until then, offer it (it skips what's already done, so a no costs nothing later).
+SIGNING_CONF="${HOME}/Library/Application Support/Swollzy/signing.conf"
+if [[ ! -f "${SIGNING_CONF}" && -z "${DEVELOPER_ID:-}" && -t 0 ]]; then
+    echo
+    echo "Apple signing isn't set up on this Mac yet, so friends would have to click 'Open Anyway'."
+    read -r -p "Set it up now? It's once, about 5 minutes, and needs your Apple Developer account. [Y/n] " ANSWER || ANSWER="n"
+    case "${ANSWER}" in
+        [nN]*) echo "Making an unsigned DMG. Double-click Set Up Signing.command any time to add signing." ;;
+        *) bash "${HERE}/Set Up Signing.command" --inline || echo "Signing isn't set up, so this DMG is unsigned." ;;
+    esac
+fi
+
 WORK="$(mktemp -d)"
 trap 'rm -rf "${WORK}"' EXIT
 VERSION="$(bash "${HERE}/dmg/stage.sh" "${WORK}/Burrow")" || finish 1
@@ -47,10 +60,13 @@ if bash "${HERE}/dmg/make-dmg.sh" "${WORK}/Burrow" "${OUT}"; then
     done
     open "${OUT}"
     echo
-    echo "  Send friends the .dmg. It has a 'Read Me First' with the one-time"
-    echo "  'Open Anyway' step macOS asks for on apps that aren't from the App Store."
+    echo "  Send friends the .dmg."
     finish 0
 fi
 echo
-echo "  Didn't build. Send Burrow-build-error.log from ${OUT} to Claude."
+if [[ -f "${OUT}/Burrow-notarize.log" ]]; then
+    echo "  Apple didn't notarize Burrow. Run this again, or send Burrow-notarize.log from ${OUT} to Claude."
+else
+    echo "  Didn't build. Send Burrow-build-error.log from ${OUT} to Claude."
+fi
 finish 1

@@ -6,6 +6,14 @@ INSTALL (30 seconds)
 1. Drag Burrow onto the Applications folder in this window.
 2. Open your Applications folder and double-click Burrow.
 
+[signed]
+THE FIRST TIME YOU OPEN IT
+
+macOS asks whether to open an app downloaded from the internet. Click
+Open. Burrow is checked by Apple, so that is the only question.
+
+[/]
+[unsigned]
 THE FIRST TIME YOU OPEN IT
 
 Burrow is free and isn't sold through the App Store, so the first time
@@ -21,6 +29,7 @@ You only do this once. After that it opens like any other app.
 (On macOS 14 Sonoma or older you can also right-click Burrow in
 Applications, choose Open, then click Open.)
 
+[/]
 USING IT
 
 - Start on the Setup tab. It downloads Wine (the free engine that runs

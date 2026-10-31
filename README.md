@@ -59,19 +59,27 @@ The window has five tabs:
 
 On your Mac, download this repo (**Code → Download ZIP**, or `git clone`) and double-click
 **Make DMG.command**. It compiles the Burrow window for Apple Silicon and Intel, puts the
-command-line tool inside the app, ad-hoc signs it and writes `~/Desktop/DMGs/Burrow-<version>.dmg`:
+command-line tool inside the app, signs it and writes `~/Desktop/DMGs/Burrow-<version>.dmg`:
 a window with Burrow, an arrow, the Applications folder and a "Read Me First".
 
 - If macOS won't open the `.command`: System Settings > Privacy & Security > **Open Anyway**,
   or in Terminal type `bash ` and drag the file in.
 - The first time, macOS asks whether Terminal may control Finder. Click **OK**: that lays out
   the DMG window. Saying no still makes a working, plain-looking DMG.
-- Friends drag Burrow to Applications and do macOS's one-time **Open Anyway** step (the Read
-  Me walks through it). On first launch Burrow copies its tool to
-  `~/Library/Application Support/Burrow/app`, the same place `install.sh` uses.
-- A paid Apple Developer account removes that warning. `dmg/make-dmg.sh` already supports
-  `DEVELOPER_ID="Developer ID Application: …"` and `NOTARY_PROFILE=<notarytool profile>`
-  (untested, as there's no account yet).
+- With the paid Apple Developer account, double-click **Set Up Signing.command** once (Make
+  DMG also offers it). It makes the Developer ID Application certificate if the keychain has
+  none (it writes a request file to the Desktop and opens Apple's page: pick **Developer ID
+  Application**, upload the file, click Download), saves the notary login (Apple ID plus an
+  app-specific password from account.apple.com) in the keychain as notarytool profile
+  `Swollzy`, and writes `~/Library/Application Support/Swollzy/signing.conf` (no passwords).
+  From then on each DMG is signed with the hardened runtime, notarized by Apple and stapled,
+  and friends just drag and open it. If Apple says no, the DMG is deleted and the reason is in
+  `~/Desktop/DMGs/Burrow-notarize.log`. One setup covers Wallflower, Swivel and Molt too: they
+  share `dmg/signing.sh`.
+- Without that setup the app is ad-hoc signed, and friends do macOS's one-time **Open Anyway**
+  step (the Read Me walks through it).
+- On first launch Burrow copies its tool to `~/Library/Application Support/Burrow/app`, the
+  same place `install.sh` uses.
 - Build errors go to `~/Desktop/DMGs/Burrow-build-error.log`. A new build removes the older
   `Burrow-*.dmg` files in that folder.
 
@@ -234,6 +242,7 @@ wrapper/                   the steamwebhelper wrapper (source and prebuilt .exe)
 tests/                     Linux Wine tests with small Windows test programs
 scripts/package.sh         builds dist/Burrow-<version>.zip
 Make DMG.command           builds ~/Desktop/DMGs/Burrow-<version>.dmg on a Mac
+Set Up Signing.command     once per Mac: Developer ID certificate and notary login for the DMGs
 dmg/                       DMG build: stage.sh, make-dmg.sh, window background, Read Me
 ```
 
