@@ -41,5 +41,8 @@ USING IT
 Burrow doesn't include Wine, DXMT or Steam; it downloads them from their
 own projects. Games that need DirectX 12 or kernel anti-cheat won't run.
 
+To remove Burrow later: Burrow > Settings > Uninstall Burrow. Your games
+stay unless you tick the box to delete them too.
+
 Needs macOS 13 Ventura or newer. Works on Apple Silicon and Intel Macs.
 On Intel Macs turbo graphics isn't available, so stick to older or 2D games.

@@ -7,7 +7,7 @@
 # no mapfile. Run `burrow help` for the commands.
 set -u
 
-BURROW_VERSION="0.3.3"
+BURROW_VERSION="0.3.4"
 
 # --- Paths and pinned downloads -------------------------------------------------------
 BURROW_HOME="${BURROW_HOME:-$HOME/Library/Application Support/Burrow}"
@@ -432,6 +432,15 @@ cmd_bottle_create() { # name [preset]
 # Stops everything running in a bottle.
 stop_bottle() { ( bottle_env "$1" && "$WINESERVER" -k ) >/dev/null 2>&1; return 0; }
 
+# Wine's background processes stay a few seconds after any Wine command (a settings change, say).
+# Copying a bottle waits for them to go, so it isn't refused or copied mid-write. Any still there
+# after 15 seconds are stopped, which loses nothing.
+settle_bottle() { # bottle
+  local i
+  for i in $(seq 1 15); do bottle_busy "$1" || return 0; [ "$i" = 15 ] || sleep 1; done
+  stop_bottle "$1"; sleep 1
+}
+
 # True when Wine programs are running in the bottle.
 bottle_busy() { running_procs | cut -f1 | grep -qxF "$1"; }
 # Like bottle_busy, but not counting Wine's own background processes, which stay a few seconds
@@ -494,7 +503,8 @@ cmd_bottle() {
       [ -n "$dst" ] || die "usage: burrow bottle clone <bottle> <new name>"
       case "$dst" in */*|.*) die "bottle names can't contain / or start with ." ;; esac
       [ -e "$(bottle_dir "$dst")" ] && die "there's already a bottle named '$dst'"
-      bottle_busy "$src" && die "quit the programs running in '$src' first (burrow kill '$src')"
+      bottle_has_programs "$src" && die "quit the programs running in '$src' first (burrow kill '$src')"
+      settle_bottle "$src"
       step "Copying bottle '$src' to '$dst'…"
       clone_tree "$(bottle_dir "$src")" "$(bottle_dir "$dst")" || die "couldn't copy the bottle"
       ok "Made bottle '$dst' (programs in it aren't in your library; add them with burrow add)" ;;
@@ -635,10 +645,11 @@ cmd_snapshot() {
     save|take|new)
       local label="${1:-}" force="${2:-}"
       [ "$label" = --force ] && { force=--force; label=""; }
-      if bottle_busy "$bottle"; then
+      if bottle_has_programs "$bottle"; then
         [ "$force" = --force ] || die "programs are running in '$bottle'; quit them first (or add --force to stop them)"
         stop_bottle "$bottle"
       fi
+      settle_bottle "$bottle"
       local id dir n=2; id=$(date +%Y%m%d-%H%M%S); dir=$(snapshot_dir "$bottle" "$id")
       while [ -e "$dir" ]; do dir=$(snapshot_dir "$bottle" "$id-$n"); n=$((n + 1)); done
       id=$(basename "$dir")
@@ -1466,17 +1477,31 @@ build_menu_app() { # dest
 # folder. Bottles, games, snapshots, the library, settings and shortcuts are never touched.
 VERSION_MARKER="$BURROW_HOME/.burrow-version"
 
-CLEAN_KB=0; CLEAN_N=0; CLEAN_DRY=0; CLEAN_QUIET=0
-clean_path() { # path why
-  [ -e "$1" ] || [ -L "$1" ] || return 0
+CLEAN_KB=0; CLEAN_N=0; CLEAN_DRY=0; CLEAN_QUIET=0; CLEAN_TITLE="Cleaning up files from older versions of Burrow…"
+clean_note() { # path why: counts it and says what goes
   local kb shown="$1"; kb=$(kb_size "$1")
   case "$1" in "$HOME"/*) shown="~${1#"$HOME"}" ;; esac
   CLEAN_KB=$((CLEAN_KB + ${kb:-0})); CLEAN_N=$((CLEAN_N + 1))
   if [ "$CLEAN_QUIET" = 0 ]; then
-    [ "$CLEAN_N" = 1 ] && step "Cleaning up files from older versions of Burrow…"
+    [ "$CLEAN_N" = 1 ] && step "$CLEAN_TITLE"
     say "  $2: $shown ($(human_kb "${kb:-0}"))"
   fi
+}
+clean_path() { # path why
+  [ -e "$1" ] || [ -L "$1" ] || return 0
+  clean_note "$1" "$2"
   [ "$CLEAN_DRY" = 1 ] || rm -rf "$1"
+}
+# Like clean_path, but to the Trash: people look for a removed app there.
+trash_path() { # path why
+  [ -e "$1" ] || return 0
+  clean_note "$1" "$2"
+  [ "$CLEAN_DRY" = 1 ] && return 0
+  local to; to="$HOME/.Trash/$(basename "$1")"
+  [ ! -e "$to" ] || to="$HOME/.Trash/$(basename "$1" .app) $(date +%H.%M.%S).app"
+  mv "$1" "$to" 2>/dev/null \
+    || osascript -e "tell application \"Finder\" to delete (POSIX file \"$(applescript_quote "$1")\")" >/dev/null 2>&1 \
+    || warn "couldn't move $1 to the Trash; drag it there yourself"
 }
 
 # Temp files named with a process id (.extract.123, file.tmp.123) are stale once it has exited.
@@ -1582,6 +1607,119 @@ cmd_cleanup() { # [--dry-run] [--quiet] [--keep-app PATH] [--if-updated]
     if [ "$CLEAN_N" = 0 ]; then [ "$if_updated" = 1 ] || ok "Nothing to clean up"
     elif [ "$CLEAN_DRY" = 1 ]; then ok "Would free $(human_kb "$CLEAN_KB") ($CLEAN_N items)"
     else ok "Freed $(human_kb "$CLEAN_KB") ($CLEAN_N items). Your bottles, games and settings weren't touched."; fi
+  fi
+  return 0
+}
+
+# --- Uninstall -----------------------------------------------------------------------------------
+# Takes Burrow off this Mac: Wine, DXMT and winetricks, downloads and turbo build files, logs, the
+# burrow tool and its Terminal command, Dock shortcuts, the window's settings and the permissions
+# macOS gave it, and Burrow.app (to the Trash). Bottles hold the installed games and their saves,
+# so they stay, with the library and snapshots, and installing Burrow again brings them back.
+# --everything deletes those too.
+cmd_uninstall() { # [--everything] [--yes] [--dry-run] [--keep-app PATH]
+  local everything=0 yes=0 keep_app="" d answer
+  CLEAN_KB=0; CLEAN_N=0; CLEAN_DRY=0; CLEAN_QUIET=0; CLEAN_TITLE="Removing Burrow…"
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --everything|--all) everything=1; shift ;;
+      --yes|-y) yes=1; shift ;;
+      --dry-run|-n) CLEAN_DRY=1; shift ;;
+      --keep-app) need_value "$@"; keep_app="${2%/}"; shift 2 ;;   # Burrow.app trashes itself
+      *) die "unknown option '$1' (burrow uninstall [--everything] [--yes] [--dry-run])" ;;
+    esac
+  done
+  case "${BURROW_HOME%/}" in ""|"$HOME"|*/..|*/../*) die "not removing $BURROW_HOME" ;; esac
+
+  if [ "$CLEAN_DRY" = 0 ]; then
+    local busy=""
+    for d in "$BOTTLES"/*/; do
+      [ -d "$d" ] && bottle_has_programs "$(basename "$d")" && busy="$busy${busy:+, }$(basename "$d")"
+    done
+    [ -z "$busy" ] || die "Windows programs are still running in: $busy. Quit them first (Usage tab > Force Quit, or: burrow kill)."
+  fi
+  if [ "$yes" = 0 ] && [ "$CLEAN_DRY" = 0 ]; then
+    [ -t 0 ] || die "add --yes to uninstall without being asked (or --dry-run to see what would go)"
+    local games; games=$(human_kb "$(kb_size "$BOTTLES")")
+    if [ "$everything" = 1 ]; then
+      say "This removes Burrow and deletes every bottle: your installed Windows games and programs, and their saves ($games)."
+      printf 'Type DELETE to go ahead: '; read -r answer || answer=""
+      [ "$answer" = DELETE ] || { say "Nothing was removed."; return 1; }
+    else
+      say "This removes Burrow. Your bottles (installed games and their saves, $games) stay in $BURROW_HOME."
+      printf 'Uninstall Burrow? [y/N] '; read -r answer || answer=""
+      case "$answer" in [yY]*) ;; *) say "Nothing was removed."; return 1 ;; esac
+    fi
+  fi
+
+  # Wine's background processes (wineserver) would keep engine files open.
+  if [ "$CLEAN_DRY" = 0 ]; then
+    for d in "$BOTTLES"/*/; do [ -d "$d/prefix" ] && stop_bottle "$(basename "$d")"; done
+  fi
+  clean_path "$ENGINES" "Wine"
+  clean_path "$RUNTIMES" "DXMT and winetricks"
+  clean_path "$CACHE" "downloads"
+  clean_path "$HOME/Library/Caches/Burrow" "turbo build files"
+  clean_path "$LOGS" "logs"
+  # Dock shortcuts start the burrow tool, which is going. Burrow's own folder goes whole; a
+  # folder chosen with BURROW_SHORTCUTS may hold other apps, so there only Burrow's go.
+  if [ "$SHORTCUTS" = "$HOME/Applications/Burrow" ]; then
+    clean_path "$SHORTCUTS" "Dock shortcuts"
+  else
+    local f
+    for f in "$LIBRARY"/*.app.conf; do
+      [ -f "$f" ] && clean_path "$SHORTCUTS/$(conf_get "$f" name | tr '/:' '--').app" "Dock shortcut"
+    done
+  fi
+  clean_path "$BURROW_HOME/app" "the burrow tool"
+  clean_path "$BURROW_HOME/app.new" "the burrow tool"
+  [ "$CLEAN_DRY" = 1 ] || rm -f "$VERSION_MARKER"
+  local link="$HOME/.local/bin/burrow"
+  if [ -L "$link" ]; then
+    case "$(readlink "$link")" in "$BURROW_HOME/app/"*) clean_path "$link" "the burrow command in Terminal" ;; esac
+  fi
+  # install.sh put ~/.local/bin on the PATH. When nothing else lives there, that line goes too.
+  if [ "$CLEAN_DRY" = 0 ] && [ ! -L "$link" ] && rmdir "$HOME/.local/bin" 2>/dev/null; then
+    local rc
+    for rc in "$HOME/.zprofile" "$HOME/.bash_profile"; do
+      [ -f "$rc" ] && grep -q '# added by Burrow$' "$rc" || continue
+      { grep -v '# added by Burrow$' "$rc" || true; } > "$rc.burrow-tmp" && cat "$rc.burrow-tmp" > "$rc"
+      rm -f "$rc.burrow-tmp"
+    done
+  fi
+  if is_mac; then
+    [ "$CLEAN_DRY" = 1 ] || defaults delete com.swollzy.burrow >/dev/null 2>&1 || true
+    clean_path "$HOME/Library/Preferences/com.swollzy.burrow.plist" "window settings"
+    clean_path "$HOME/Library/Saved Application State/com.swollzy.burrow.savedState" "window settings"
+    clean_path "$HOME/Library/Caches/com.swollzy.burrow" "caches"
+    clean_path "$HOME/Library/HTTPStorages/com.swollzy.burrow" "caches"
+    # Folder access and the like, so a later install asks again instead of inheriting it.
+    [ "$CLEAN_DRY" = 1 ] || tccutil reset All com.swollzy.burrow >/dev/null 2>&1 || true
+    local a
+    for a in /Applications/Burrow.app "$HOME/Applications/Burrow.app"; do
+      [ "$a" = "$keep_app" ] && continue
+      [ -d "$a" ] && [ "$(bundle_id "$a")" = com.swollzy.burrow ] && trash_path "$a" "Burrow (to the Trash)"
+    done
+  fi
+
+  if [ "$everything" = 1 ]; then
+    clean_path "$BOTTLES" "bottles: installed games and programs, and their saves"
+    clean_path "$SNAPSHOTS" "snapshots"
+    clean_path "$LIBRARY" "library"
+    [ "$CLEAN_DRY" = 1 ] || rm -rf "$BURROW_HOME"
+  elif [ "$CLEAN_DRY" = 0 ]; then
+    # Folders with nothing in them aren't worth keeping.
+    rmdir "$BOTTLES" "$LIBRARY" "$SNAPSHOTS" 2>/dev/null
+    rmdir "$BURROW_HOME" 2>/dev/null
+  fi
+
+  if [ "$CLEAN_DRY" = 1 ]; then
+    ok "Uninstalling would free $(human_kb "$CLEAN_KB") ($CLEAN_N items)$([ "$everything" = 1 ] || printf '. Bottles, games and the library would stay.')"
+  elif [ "$everything" = 1 ]; then
+    ok "Burrow is uninstalled, with its bottles and games. Freed $(human_kb "$CLEAN_KB")."
+  else
+    ok "Burrow is uninstalled. Freed $(human_kb "$CLEAN_KB")."
+    [ -d "$BURROW_HOME" ] && say "Your bottles and games ($(human_kb "$(kb_size "$BURROW_HOME")")) are still in $BURROW_HOME. Install Burrow again to play them, or delete that folder to free the space."
   fi
   return 0
 }
@@ -1790,6 +1928,7 @@ ${B}Burrow $BURROW_VERSION${N}: Windows programs and Windows Steam on your Mac.
   burrow usage --ram               just the memory of running programs
   burrow doctor                    check everything
   burrow cleanup [--dry-run]       remove files older versions left behind (bottles stay)
+  burrow uninstall [--everything]  remove Burrow; bottles (games, saves) stay unless --everything
   burrow app                       (re)build Burrow.app, the window app
 
 Files live in: $BURROW_HOME
@@ -1823,6 +1962,7 @@ main() {
     kill|stop) cmd_kill "$@" ;;
     doctor) cmd_doctor ;;
     cleanup|clean) cmd_cleanup "$@" ;;
+    uninstall) cmd_uninstall "$@" ;;
     app) cmd_app "$@" ;;
     version|--version|-v) say "burrow $BURROW_VERSION" ;;
     help|--help|-h) usage ;;

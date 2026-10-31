@@ -297,5 +297,35 @@ check "turbo build refuses without Apple Silicon" 'BURROW_TURBO_ANYWHERE=0 "$bur
 "$burrow" remove T1 >/dev/null
 rm -rf "$h/engines/wine-11.18" "$h/engines/wine-11.18-turbo" "$h/engines/wine-9.0"
 
+# A snapshot or copy right after a Wine command waits for Wine's background processes to go.
+WINEPREFIX="$h/bottles/Tweak/prefix" "$(dirname "$WINEBIN")/wineserver" -p 30 >/dev/null 2>&1
+check "snapshot waits out Wine's background processes" '"$burrow" snapshot save Tweak lingering >/dev/null 2>&1 && "$burrow" snapshot list Tweak --plain | grep -q "	lingering	"'
+
+# Uninstall: Burrow's own files go; bottles (games, saves), the library and snapshots stay unless
+# --everything. Never while Windows programs run.
+"$burrow" run Tweak notepad >/dev/null 2>&1 &
+for _ in 1 2 3 4 5 6 7 8 9 10; do "$burrow" usage --ram --plain | grep -qi "notepad.exe" && break; sleep 1; done
+check "uninstall waits while Windows programs run" '! HOME="$work/fakehome" "$burrow" uninstall --yes > "$work/un0.txt" 2>&1 && grep -q "still running in: Tweak" "$work/un0.txt" && [ -d "$h/bottles/Tweak/prefix" ] && [ -d "$h/runtimes" ]'
+"$burrow" kill Tweak >/dev/null 2>&1
+u="$work/uhome"; fh="$work/fakehome"
+mkdir -p "$u/engines/wine-11.18/bin" "$u/runtimes/dxmt-v0.80" "$u/cache/downloads" "$u/logs" "$u/app/bin" \
+  "$u/bottles/Keep/prefix/drive_c/saves" "$u/library" "$u/snapshots/Keep" "$work/ushort/Keep Game.app/Contents" \
+  "$work/ushort/Other.app" "$fh/.local/bin" "$fh/Library/Caches/Burrow/turbo"
+cp "$burrow" "$u/app/bin/burrow"
+printf 'name=Keep Game\nbottle=Keep\ntarget=C:\\x.exe\n' > "$u/library/keep-game.app.conf"
+ln -s "$u/app/bin/burrow" "$fh/.local/bin/burrow"
+printf 'export FOO=1\n\nexport PATH="$HOME/.local/bin:$PATH" # added by Burrow\n' > "$fh/.zprofile"
+touch "$u/.burrow-version" "$u/logs/a-20990101-000000.log"
+un() { HOME="$fh" BURROW_HOME="$u" BURROW_SHORTCUTS="$work/ushort" "$@"; }
+check "uninstall asks first, and refuses without --yes when it can't ask" '! un "$burrow" uninstall </dev/null >/dev/null 2>&1 && [ -d "$u/engines" ]'
+un "$burrow" uninstall --dry-run > "$work/un1.txt" 2>&1
+check "uninstall --dry-run lists what goes and removes nothing" 'grep -q "Wine:" "$work/un1.txt" && grep -q "would stay" "$work/un1.txt" && [ -d "$u/engines" ] && [ -L "$fh/.local/bin/burrow" ]'
+un "$u/app/bin/burrow" uninstall --yes > "$work/un2.txt" 2>&1   # the installed copy, removing itself
+check "uninstall removes Burrow's files" '[ ! -e "$u/engines" ] && [ ! -e "$u/runtimes" ] && [ ! -e "$u/cache" ] && [ ! -e "$u/logs" ] && [ ! -e "$u/app" ] && [ ! -e "$u/.burrow-version" ] && [ ! -e "$fh/Library/Caches/Burrow" ] && [ ! -e "$work/ushort/Keep Game.app" ]'
+check "uninstall keeps bottles, the library, snapshots and other apps" '[ -d "$u/bottles/Keep/prefix/drive_c/saves" ] && [ -f "$u/library/keep-game.app.conf" ] && [ -d "$u/snapshots/Keep" ] && [ -d "$work/ushort/Other.app" ] && grep -q "still in" "$work/un2.txt"'
+check "uninstall removes the burrow command and its PATH line, nothing else" '[ ! -e "$fh/.local/bin" ] && ! grep -q "added by Burrow" "$fh/.zprofile" && grep -q "^export FOO=1$" "$fh/.zprofile"'
+un "$burrow" uninstall --everything --yes > "$work/un3.txt" 2>&1
+check "uninstall --everything deletes bottles and games too" '[ ! -e "$u" ] && grep -q "with its bottles and games" "$work/un3.txt"'
+
 echo; echo "$pass passed, $fail failed"
 [ "$fail" = 0 ]

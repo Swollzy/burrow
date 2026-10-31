@@ -13,6 +13,11 @@
   <key>LSApplicationCategoryType</key><string>public.app-category.games</string>
   <key>NSHighResolutionCapable</key><true/>
   <key>NSAppleEventsUsageDescription</key><string>Burrow opens Terminal to install Homebrew.</string>
+  <key>NSDocumentsFolderUsageDescription</key><string>Windows games and programs in Burrow see your Documents folder as My Documents, where many keep their saves and settings.</string>
+  <key>NSDesktopFolderUsageDescription</key><string>Windows programs in Burrow see your Desktop as theirs, and installers may put files there.</string>
+  <key>NSDownloadsFolderUsageDescription</key><string>Burrow runs the Windows installers you downloaded.</string>
+  <key>NSRemovableVolumesUsageDescription</key><string>Burrow can run games and Steam libraries from an external drive.</string>
+  <key>NSNetworkVolumesUsageDescription</key><string>Burrow can run Windows programs and open files on a network drive.</string>
   <key>CFBundleDocumentTypes</key>
   <array>
     <dict>

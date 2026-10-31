@@ -55,6 +55,15 @@ The window has five tabs:
   program, grouped by bottle, with Quit buttons.
 - **Setup**: each step with a check mark, plus "Check Everything" and the logs folder.
 
+**Burrow > Settings** (⌘,) turns notifications on or off and has **Uninstall Burrow…**.
+
+- **Notifications**: when Wine setup, the turbo build, an install or another long job finishes
+  or stops with an error while you're in another app, Burrow says so in Notification Center
+  (macOS asks once, the first time a job starts). Clicking an error opens its details.
+- **Permissions**: Windows programs see your Documents, Desktop and Downloads folders as their
+  own, so macOS asks before Burrow uses them, saying why. A signed Burrow keeps those answers
+  across updates.
+
 ## Share it as a DMG (no Terminal for friends)
 
 On your Mac, download this repo (**Code → Download ZIP**, or `git clone`) and double-click
@@ -92,6 +101,16 @@ and an older copy of Burrow.app in the other Applications folder. Your bottles, 
 snapshots, library, settings and shortcuts stay. Old Wine engines wait while Windows programs
 are running. Run it yourself with `burrow cleanup` (`--dry-run` lists what it would remove) or
 **Clean Up Old Files** on the Setup tab.
+
+## Uninstalling
+
+**Burrow > Settings > Uninstall Burrow…**, or `burrow uninstall` in Terminal (`--dry-run` lists
+what it would remove). It removes Wine, DXMT and winetricks, the downloads and turbo build
+files, logs, the `burrow` command, Dock shortcuts, the window's settings, the permissions macOS
+gave Burrow, and Burrow.app (to the Trash). Your bottles hold your installed games and their
+saves, so they stay, with the library and snapshots: installing Burrow again brings them back.
+Tick **Also delete my games and bottles** (asked twice), or add `--everything`, to delete those
+too. Windows programs have to be closed first.
 
 ## Bottles: lightweight Windows VMs
 
@@ -180,6 +199,7 @@ burrow usage                   disk space per bottle and game, RAM of running pr
 burrow usage --ram             just the memory of running programs
 burrow doctor                  check everything
 burrow cleanup [--dry-run]     remove files older versions left behind (bottles stay)
+burrow uninstall [--everything] remove Burrow; bottles (games, saves) stay unless --everything
 burrow kill                    force-quit Windows programs
 
 burrow bottle new NAME --preset apps    a new bottle (also: list, clone, delete)
