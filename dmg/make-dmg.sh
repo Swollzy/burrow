@@ -137,7 +137,12 @@ mkdir -p "${STAGE}/.background"
 cp -R "${APP}" "${STAGE}/"
 ln -s /Applications "${STAGE}/Applications"
 README="${HERE}/readme/${NAME}.txt"
-sed -e "s/{{NAME}}/${NAME}/g" -e "s/{{VERSION}}/${VERSION}/g" "${README}" | signing_readme_filter "${KIND}" > "${STAGE}/Read Me First.txt"
+case "${ARCHS}" in
+    *" "*) MACS="Works on Apple Silicon and Intel Macs." ;;
+    arm64) MACS="Works on Apple Silicon Macs (M1 and later) only." ;;
+    *) MACS="Works on Intel Macs only." ;;
+esac
+sed -e "s/{{NAME}}/${NAME}/g" -e "s/{{VERSION}}/${VERSION}/g" -e "s/{{MACS}}/${MACS}/g" "${README}" | signing_readme_filter "${KIND}" > "${STAGE}/Read Me First.txt"
 BG="${HERE}/art/${NAME}-bg.png"
 BG2X="${BG%.png}@2x.png"
 if [[ -f "${BG2X}" ]] && tiffutil -cathidpicheck "${BG}" "${BG2X}" -out "${STAGE}/.background/background.tiff" >/dev/null 2>&1; then
