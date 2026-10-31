@@ -49,6 +49,7 @@ else
     KIND="unsigned"
 fi
 NOTARY_LOG="${OUT}/${NAME}-notarize.log"
+rm -f "${NOTARY_LOG}"   # an older run's, which would point Make DMG at the wrong reason
 
 WORK="$(mktemp -d)"
 DEVICE=""
@@ -204,7 +205,6 @@ rm -f "${DMG}"
 hdiutil convert -quiet "${WORK}/rw.dmg" -format UDZO -imagekey zlib-level=9 -o "${DMG}" \
     || die "hdiutil convert failed."
 
-rm -f "${NOTARY_LOG}"
 if [[ -n "${SIGN_HASH}" ]]; then
     codesign --force --timestamp --sign "${SIGN_HASH}" "${DMG}" || die "Signing the DMG failed."
     if [[ "${KIND}" == "signed" ]]; then
