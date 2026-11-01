@@ -7,7 +7,7 @@
 # no mapfile. Run `burrow help` for the commands.
 set -u
 
-BURROW_VERSION="0.3.2"
+BURROW_VERSION="0.3.4"
 
 # --- Paths and pinned downloads -------------------------------------------------------
 BURROW_HOME="${BURROW_HOME:-$HOME/Library/Application Support/Burrow}"
@@ -56,10 +56,21 @@ warn() { printf '%s!%s %s\n' "$Y" "$N" "$*" >&2; }
 die()  { printf '%serror:%s %s\n' "$R" "$N" "$*" >&2; exit 1; }
 
 is_mac() { [ "$(uname -s)" = "Darwin" ]; }
+# The hardware, not the shell: a Terminal set to "Open using Rosetta" reports x86_64 from uname -m.
+apple_silicon() { [ "$(sysctl -n hw.optional.arm64 2>/dev/null)" = 1 ] || [ "$(uname -m)" = arm64 ]; }
+mac_major() { sw_vers -productVersion 2>/dev/null | cut -d. -f1; }
 cpu_count() { sysctl -n hw.ncpu 2>/dev/null || nproc 2>/dev/null || echo 4; }
 
 # APFS clone on a Mac (nearly free), plain copy elsewhere.
-clone_tree() { if is_mac; then cp -c -R "$1" "$2" 2>/dev/null || cp -R "$1" "$2"; else cp -R "$1" "$2"; fi; }
+# A clone that fails partway leaves $2 behind, and cp -R into an existing folder would copy to $2/<name>.
+clone_tree() {
+  if is_mac && cp -c -R "$1" "$2" 2>/dev/null; then return 0; fi
+  rm -rf "$2"
+  cp -R "$1" "$2" || { rm -rf "$2"; return 1; }
+}
+
+# For option parsing: "--flag value" with the value missing would otherwise loop forever.
+need_value() { [ $# -ge 2 ] || die "$1 needs a value"; }
 
 # Turns any text into a safe file name: "Schedule I" -> "schedule-i".
 slugify() {
@@ -82,7 +93,19 @@ download() { # url dest
   local tmp="$2.part"
   mkdir -p "$(dirname "$2")"
   say "${D}  $1${N}"
-  curl -fL --retry 3 --retry-delay 2 --progress-bar -o "$tmp" "$1" || { rm -f "$tmp"; return 1; }
+  # A connection that stalls (under 1 KB/s for a minute) fails instead of hanging forever.
+  local opts=(-fL --retry 3 --retry-delay 2 --speed-limit 1024 --speed-time 60)
+  if [ -t 2 ]; then
+    curl "${opts[@]}" --progress-bar -o "$tmp" "$1" || { rm -f "$tmp"; return 1; }
+  else
+    # Burrow's window shows output as a log, where curl's redrawn bar becomes thousands of lines:
+    # print every 10% instead.
+    curl "${opts[@]}" --progress-bar -o "$tmp" "$1" 2>&1 | tr '\r' '\n' | awk '
+      /[0-9.]+%[[:space:]]*$/ { match($0, /[0-9.]+%/); p = int(substr($0, RSTART, RLENGTH - 1) / 10)
+                                if (p > last) { last = p; printf "  %d%%\n", p * 10; fflush() } next }
+      /[^#[:space:]]/ { print; fflush() }'
+    [ "${PIPESTATUS[0]}" = 0 ] || { rm -f "$tmp"; return 1; }
+  fi
   mv "$tmp" "$2"
 }
 
@@ -111,7 +134,9 @@ engine_wineserver() {
   printf '%s/bin/wineserver' "$(engine_root "$1")"
 }
 engine_ok() { engine_wine "$1" >/dev/null 2>&1; }
-best_engine() { if engine_ok "$TURBO_ENGINE"; then echo "$TURBO_ENGINE"; else echo "$STOCK_ENGINE"; fi; }
+# Turbo (DXMT) needs Apple Silicon; an Intel Mac stays on the compatible engine even if turbo was built.
+turbo_usable() { apple_silicon || [ "${BURROW_TURBO_ANYWHERE:-0}" = 1 ]; }
+best_engine() { if turbo_usable && engine_ok "$TURBO_ENGINE"; then echo "$TURBO_ENGINE"; else echo "$STOCK_ENGINE"; fi; }
 
 # --- Settings ------------------------------------------------------------------------------------
 # Every setting has a scope: "bottle" (the whole Windows install, mostly registry), "both" (set
@@ -248,11 +273,13 @@ apply_preset() { # bottle preset
 bottle_dir()    { printf '%s/%s' "$BOTTLES" "$1"; }
 bottle_prefix() { printf '%s/%s/prefix' "$BOTTLES" "$1"; }
 bottle_conf()   { printf '%s/%s/bottle.conf' "$BOTTLES" "$1"; }
-bottle_exists() { [ -d "$(bottle_prefix "$1")/drive_c" ]; }
+bottle_name_ok() { case "$1" in ""|*/*|.*) return 1 ;; esac; }
+bottle_exists() { bottle_name_ok "$1" && [ -d "$(bottle_prefix "$1")/drive_c" ]; }
 
 graphics_engine() { # graphics-setting -> engine
   case "$1" in
-    turbo|dxmt) engine_ok "$TURBO_ENGINE" || die "turbo graphics isn't built yet; run: burrow turbo"; echo "$TURBO_ENGINE" ;;
+    turbo|dxmt) turbo_usable || die "turbo graphics needs an Apple Silicon Mac; use auto or compat here"
+                engine_ok "$TURBO_ENGINE" || die "turbo graphics isn't built yet; run: burrow turbo"; echo "$TURBO_ENGINE" ;;
     compat|wined3d) echo "$STOCK_ENGINE" ;;
     auto|"") best_engine ;;
     *) die "unknown graphics mode '$1' (use auto, turbo or compat)" ;;
@@ -300,8 +327,12 @@ apply_bottle_registry() { # bottle (WINE, WINESERVER and WINEPREFIX already set)
   [ -d "$WINEPREFIX/drive_c" ] || return 0
   reg="$WINEPREFIX/drive_c/burrow-settings.reg"
   bottle_registry "$1" > "$reg"
-  "$WINE" reg import 'C:\burrow-settings.reg' >/dev/null 2>&1 || warn "Wine couldn't apply some settings to '$1'"
-  "$WINESERVER" -w 2>/dev/null
+  if ! "$WINE" reg import 'C:\burrow-settings.reg' >/dev/null 2>&1; then
+    rm -f "$reg"; warn "Wine couldn't apply some settings to '$1'; Burrow tries again next start"; return 0
+  fi
+  # Waiting lets wineserver save the registry, but while something runs in the bottle it would
+  # wait for that to quit; the running wineserver already has the new settings.
+  bottle_has_programs "$1" || "$WINESERVER" -w 2>/dev/null
   rm -f "$reg"
   conf_set "$conf" reg_applied "$want"
 }
@@ -358,7 +389,8 @@ use_bottle() { # bottle [graphics] [app-id]
   # A bottle that switched engines needs its system folder refreshed (DXMT's winemetal.dll
   # is copied into system32 by wineboot).
   local conf; conf=$(bottle_conf "$bottle")
-  if [ "$(conf_get "$conf" last_engine 2>/dev/null)" != "$engine" ] && [ -d "$WINEPREFIX/drive_c" ]; then
+  # While programs run in the bottle that would wait for them to quit, so it waits for a quiet start.
+  if [ "$(conf_get "$conf" last_engine 2>/dev/null)" != "$engine" ] && [ -d "$WINEPREFIX/drive_c" ] && ! bottle_has_programs "$bottle"; then
     "$WINE" wineboot -u >/dev/null 2>&1
     "$WINESERVER" -w 2>/dev/null
     conf_set "$conf" last_engine "$engine"
@@ -370,7 +402,7 @@ use_bottle() { # bottle [graphics] [app-id]
 new_log() { # name -> log path (keeps the newest 20 per name)
   mkdir -p "$LOGS"
   local base; base=$(slugify "$1")
-  ls -1t "$LOGS/$base"-*.log 2>/dev/null | tail -n +20 | while IFS= read -r old; do rm -f "$old"; done
+  ls -1t "$LOGS/$base"-[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]-[0-9][0-9][0-9][0-9][0-9][0-9].log 2>/dev/null | tail -n +20 | while IFS= read -r old; do rm -f "$old"; done
   printf '%s/%s-%s.log' "$LOGS" "$base" "$(date +%Y%m%d-%H%M%S)"
 }
 
@@ -400,8 +432,31 @@ cmd_bottle_create() { # name [preset]
 # Stops everything running in a bottle.
 stop_bottle() { ( bottle_env "$1" && "$WINESERVER" -k ) >/dev/null 2>&1; return 0; }
 
+# Wine's background processes stay a few seconds after any Wine command (a settings change, say).
+# Copying a bottle waits for them to go, so it isn't refused or copied mid-write. Any still there
+# after 15 seconds are stopped, which loses nothing.
+settle_bottle() { # bottle
+  local i
+  for i in $(seq 1 15); do bottle_busy "$1" || return 0; [ "$i" = 15 ] || sleep 1; done
+  stop_bottle "$1"; sleep 1
+}
+
 # True when Wine programs are running in the bottle.
 bottle_busy() { running_procs | cut -f1 | grep -qxF "$1"; }
+# Like bottle_busy, but not counting Wine's own background processes, which stay a few seconds
+# after every Wine command.
+bottle_has_programs() {
+  # Filtered in bash: an awk or grep given these names would itself look like a Wine process.
+  local b name rest
+  while IFS="$(printf '\t')" read -r b name rest; do
+    [ "$b" = "$1" ] || continue
+    case "$name" in
+      "Wine (system)"|services.exe|winedevice.exe|plugplay.exe|svchost.exe|rpcss.exe|explorer.exe|conhost.exe|start.exe|wineboot.exe|rundll32.exe) ;;
+      *) return 0 ;;
+    esac
+  done < <(running_procs)
+  return 1
+}
 
 cmd_bottle() {
   local sub="${1:-list}"; shift || true
@@ -409,7 +464,7 @@ cmd_bottle() {
     new|create)
       local name="" preset=""
       while [ $# -gt 0 ]; do
-        case "$1" in --preset) preset="${2:-}"; shift 2 ;; *) name="$1"; shift ;; esac
+        case "$1" in --preset) need_value "$@"; preset="$2"; shift 2 ;; *) name="$1"; shift ;; esac
       done
       cmd_bottle_create "$name" "$preset" ;;
     list|ls)
@@ -429,6 +484,7 @@ cmd_bottle() {
       done ;;
     delete|rm)
       local name="${1:-}"; [ -n "$name" ] || die "which bottle?"
+      bottle_name_ok "$name" || die "no bottle named '$name'"
       bottle_exists "$name" || [ -d "$(bottle_dir "$name")" ] || die "no bottle named '$name'"
       if [ "${2:-}" != "--yes" ]; then
         printf 'Delete bottle %s and everything installed in it? Type its name to confirm: ' "$name"
@@ -436,7 +492,10 @@ cmd_bottle() {
       fi
       stop_bottle "$name"
       rm -rf "${BOTTLES:?}/${name:?}" "${SNAPSHOTS:?}/${name:?}"
-      grep -lxF "bottle=$name" "$LIBRARY"/*.app.conf 2>/dev/null | while IFS= read -r f; do rm -f "$f"; done
+      grep -lxF "bottle=$name" "$LIBRARY"/*.app.conf 2>/dev/null | while IFS= read -r f; do
+        rm -rf "$SHORTCUTS/$(conf_get "$f" name | tr '/:' '--').app"
+        rm -f "$f"
+      done
       ok "Deleted bottle '$name'" ;;
     clone|copy|duplicate)
       local src="${1:-}" dst="${2:-}"
@@ -444,7 +503,8 @@ cmd_bottle() {
       [ -n "$dst" ] || die "usage: burrow bottle clone <bottle> <new name>"
       case "$dst" in */*|.*) die "bottle names can't contain / or start with ." ;; esac
       [ -e "$(bottle_dir "$dst")" ] && die "there's already a bottle named '$dst'"
-      bottle_busy "$src" && die "quit the programs running in '$src' first (burrow kill '$src')"
+      bottle_has_programs "$src" && die "quit the programs running in '$src' first (burrow kill '$src')"
+      settle_bottle "$src"
       step "Copying bottle '$src' to '$dst'…"
       clone_tree "$(bottle_dir "$src")" "$(bottle_dir "$dst")" || die "couldn't copy the bottle"
       ok "Made bottle '$dst' (programs in it aren't in your library; add them with burrow add)" ;;
@@ -461,7 +521,7 @@ cmd_settings() {
   local bottle="" app="" plain=0 rest=()
   while [ $# -gt 0 ]; do
     case "$1" in
-      --app) app="${2:-}"; shift 2 ;;
+      --app) need_value "$@"; app="$2"; shift 2 ;;
       --plain) plain=1; shift ;;
       --list) settings_list; return 0 ;;
       *) rest+=("$1"); shift ;;
@@ -585,10 +645,11 @@ cmd_snapshot() {
     save|take|new)
       local label="${1:-}" force="${2:-}"
       [ "$label" = --force ] && { force=--force; label=""; }
-      if bottle_busy "$bottle"; then
+      if bottle_has_programs "$bottle"; then
         [ "$force" = --force ] || die "programs are running in '$bottle'; quit them first (or add --force to stop them)"
         stop_bottle "$bottle"
       fi
+      settle_bottle "$bottle"
       local id dir n=2; id=$(date +%Y%m%d-%H%M%S); dir=$(snapshot_dir "$bottle" "$id")
       while [ -e "$dir" ]; do dir=$(snapshot_dir "$bottle" "$id-$n"); n=$((n + 1)); done
       id=$(basename "$dir")
@@ -723,14 +784,14 @@ check_mac() {
   is_mac || { warn "not a Mac; only the tests run here"; return 0; }
   local major; major=$(sw_vers -productVersion | cut -d. -f1)
   [ "$major" -ge 11 ] || die "Burrow needs macOS 11 or newer (this is $(sw_vers -productVersion))"
-  if [ "$(uname -m)" = arm64 ]; then
+  if apple_silicon; then
     if ! /usr/bin/arch -x86_64 /usr/bin/true 2>/dev/null; then
       step "Installing Rosetta 2 (Apple's Intel translator; Wine needs it)…"
       softwareupdate --install-rosetta --agree-to-license || die "Rosetta didn't install; run: softwareupdate --install-rosetta"
     fi
     ok "Apple Silicon with Rosetta 2"
   else
-    warn "Intel Mac: Windows programs will run, but turbo graphics (DXMT) needs Apple Silicon"
+    warn "Intel Mac: Windows programs run with compatible graphics; turbo graphics (DXMT) needs Apple Silicon"
   fi
 }
 
@@ -785,6 +846,7 @@ install_dxmt() {
 cmd_setup() {
   step "Burrow $BURROW_VERSION setup"
   mkdir -p "$ENGINES" "$RUNTIMES" "$BOTTLES" "$LIBRARY" "$LOGS" "$CACHE"
+  cmd_cleanup --if-updated
   check_mac
   if [ -n "${BURROW_WINE:-}" ]; then ok "Using $BURROW_WINE"; else install_wine; fi
   install_dxmt
@@ -793,7 +855,7 @@ cmd_setup() {
     warn "  https://gstreamer.freedesktop.org/download/#macos  (the 'runtime installer' .pkg)"
   fi
   if engine_ok "$TURBO_ENGINE"; then ok "Turbo graphics is built"
-  else say ""; say "Next: ${B}burrow turbo${N} builds the fast Metal graphics most 3D games need (one time, a few minutes)."; fi
+  elif turbo_usable; then say ""; say "Next: ${B}burrow turbo${N} builds the fast Metal graphics most 3D games need (one time, a few minutes)."; fi
   say "Then: ${B}burrow steam${N} installs and opens Windows Steam."
 }
 
@@ -802,12 +864,14 @@ cmd_setup() {
 # driver (and a few DLLs games trip over) is rebuilt from the matching Wine source with the
 # patches in engine/wine-patches (from Neutron, MIT; the patches are LGPL like Wine). Only
 # those files are compiled, then DXMT's DLLs are laid over a clone of the stock engine.
+turbo_assemble_failed() { rm -rf "$1"; die "couldn't assemble the turbo engine (see the error above)"; }
+
 cmd_turbo() {
   is_mac || [ "${BURROW_TURBO_ANYWHERE:-0}" = 1 ] || die "turbo graphics is built on the Mac itself"
+  turbo_usable || die "turbo graphics (DXMT) needs an Apple Silicon Mac; on this Mac games use compatible graphics"
   engine_ok "$STOCK_ENGINE" || cmd_setup
   install_dxmt
   if [ "${1:-}" != "--rebuild" ] && engine_ok "$TURBO_ENGINE"; then ok "Turbo graphics is already built (burrow turbo --rebuild to redo it)"; return 0; fi
-  [ "$(uname -m)" = arm64 ] || warn "DXMT needs Apple Silicon; building anyway"
 
   step "Checking build tools…"
   if ! xcode-select -p >/dev/null 2>&1; then
@@ -847,20 +911,21 @@ cmd_turbo() {
     [ -f "$CACHE/turbo/wine-$version.tar.xz" ] && [ ! -f "$work/wine-$version.tar.xz" ] && mv "$CACHE/turbo/wine-$version.tar.xz" "$work/"
     rm -rf "${CACHE:?}/turbo"
   fi
-  local applied="$src/.burrow-patches"
-  if [ -d "$src" ] && [ ! -f "$applied" ]; then rm -rf "$src"; fi
+  # The source tree is reused only when exactly this set of patches applied cleanly to it; a
+  # half-applied or changed patch set starts again from the (cached) source archive.
+  local applied="$src/.burrow-patches" want p name
+  want=$(for p in "$patches"/*.patch; do printf '%s %s\n' "$(basename "$p")" "$(cksum < "$p" | awk '{print $1}')"; done)
+  if [ -d "$src" ] && [ "$(cat "$applied" 2>/dev/null)" != "$want" ]; then rm -rf "$src"; fi
   if [ ! -d "$src" ]; then
     [ -f "$work/wine-$version.tar.xz" ] || { step "Downloading the Wine $version source…"; download "https://dl.winehq.org/wine/source/$series/wine-$version.tar.xz" "$work/wine-$version.tar.xz" || die "couldn't download the Wine source"; }
-    tar -xJf "$work/wine-$version.tar.xz" -C "$work" || die "couldn't unpack the Wine source"
-    : > "$applied"
+    tar -xJf "$work/wine-$version.tar.xz" -C "$work" || { rm -rf "$src" "$work/wine-$version.tar.xz"; die "couldn't unpack the Wine source (it'll download again next time)"; }
+    for p in "$patches"/*.patch; do
+      name=$(basename "$p")
+      (cd "$src" && patch -p1 --forward --quiet < "$p") \
+        || { rm -rf "$src"; die "patch $name doesn't fit Wine $version (the patches were tested on 11.18)"; }
+    done
+    printf '%s\n' "$want" > "$applied"
   fi
-  local p name
-  for p in "$patches"/*.patch; do
-    name=$(basename "$p")
-    grep -qx "$name" "$applied" && continue
-    (cd "$src" && patch -p1 --forward --quiet < "$p") || die "patch $name doesn't fit Wine $version (the patches were tested on 11.18)"
-    echo "$name" >> "$applied"
-  done
 
   mkdir -p "$build"
   export MACOSX_DEPLOYMENT_TARGET=10.15
@@ -886,11 +951,11 @@ cmd_turbo() {
   step "Assembling the turbo engine…"
   local out; out=$(engine_root "$TURBO_ENGINE")
   rm -rf "$out.new"; clone_tree "$stock" "$out.new" || die "couldn't copy the engine"
-  cp "$build/dlls/winemac.drv/winemac.so" "$out.new/lib/wine/x86_64-unix/winemac.so"
-  x86_64-w64-mingw32-strip -o "$out.new/lib/wine/x86_64-windows/mfreadwrite.dll" "$build/dlls/mfreadwrite/x86_64-windows/mfreadwrite.dll"
+  cp "$build/dlls/winemac.drv/winemac.so" "$out.new/lib/wine/x86_64-unix/winemac.so" || turbo_assemble_failed "$out.new"
+  x86_64-w64-mingw32-strip -o "$out.new/lib/wine/x86_64-windows/mfreadwrite.dll" "$build/dlls/mfreadwrite/x86_64-windows/mfreadwrite.dll" || turbo_assemble_failed "$out.new"
   for n in $pe_dlls; do
-    i686-w64-mingw32-strip -o "$out.new/lib/wine/i386-windows/$n.dll" "$build/dlls/$n/i386-windows/$n.dll"
-    x86_64-w64-mingw32-strip -o "$out.new/lib/wine/x86_64-windows/$n.dll" "$build/dlls/$n/x86_64-windows/$n.dll"
+    i686-w64-mingw32-strip -o "$out.new/lib/wine/i386-windows/$n.dll" "$build/dlls/$n/i386-windows/$n.dll" || turbo_assemble_failed "$out.new"
+    x86_64-w64-mingw32-strip -o "$out.new/lib/wine/x86_64-windows/$n.dll" "$build/dlls/$n/x86_64-windows/$n.dll" || turbo_assemble_failed "$out.new"
   done
   overlay_dxmt "$out.new"
   rm -rf "$out"; mv "$out.new" "$out"
@@ -922,33 +987,40 @@ overlay_dxmt() { # engine-root
 lib_file() { printf '%s/%s.app.conf' "$LIBRARY" "$1"; }
 
 # Adds a program to the library. target is a Windows path (C:\...), a .lnk or .exe in the bottle.
-# The same name in the same bottle replaces the old entry (a reinstall); the same name in
-# another bottle gets its own id ("name-2") so neither hides the other.
-lib_add() { # name bottle target [args]
-  local name="$1" bottle="$2" target="$3" args="${4:-}" id f n=2
-  id=$(slugify "$name"); [ -n "$id" ] || id="app"
-  f=$(lib_file "$id")
-  if [ -f "$f" ] && [ "$(conf_get "$f" bottle)" != "$bottle" ]; then
-    while [ -f "$(lib_file "$id-$n")" ] && [ "$(conf_get "$(lib_file "$id-$n")" bottle)" != "$bottle" ]; do n=$((n + 1)); done
-    id="$id-$n"; f=$(lib_file "$id")
-  fi
+# The same name in the same bottle replaces the old entry (a reinstall) and keeps its per-app
+# settings; anything else whose name makes the same id (another bottle, or names like "Doom" and
+# "DOOM!", or non-Latin names that all become "app") gets its own id ("name-2") so none hides another.
+lib_add() { # name bottle target [args] [steam-appid]
+  local name="$1" bottle="$2" target="$3" args="${4:-}" appid="${5:-}" base id f n=2
+  base=$(slugify "$name"); [ -n "$base" ] || base="app"
+  id="$base"; f=$(lib_file "$id")
+  # Steam games are told apart by app id too: two games can have the same name.
+  while [ -f "$f" ] && { [ "$(conf_get "$f" bottle)" != "$bottle" ] || [ "$(conf_get "$f" name)" != "$name" ] \
+      || [ "$(conf_get "$f" steam_appid 2>/dev/null)" != "$appid" ]; }; do
+    id="$base-$n"; f=$(lib_file "$id"); n=$((n + 1))
+  done
   mkdir -p "$LIBRARY"
-  { printf 'name=%s\n' "$name"; printf 'bottle=%s\n' "$bottle"; printf 'target=%s\n' "$target"
-    printf 'args=%s\n' "$args"; printf 'graphics=auto\n'; } > "$f"
+  if [ -f "$f" ]; then
+    conf_set "$f" target "$target"; conf_set "$f" args "$args"
+  else
+    { printf 'name=%s\n' "$name"; printf 'bottle=%s\n' "$bottle"; printf 'target=%s\n' "$target"
+      printf 'args=%s\n' "$args"; printf 'graphics=auto\n'; [ -z "$appid" ] || printf 'steam_appid=%s\n' "$appid"; } > "$f"
+  fi
   printf '%s' "$id"
 }
 
-# Finds an app by id or by name (case-insensitive).
+# Finds an app by id, then by its exact name (case-insensitive), then by the id its name makes.
 lib_find() {
-  local q="$1" f id
-  [ -f "$(lib_file "$q")" ] && { printf '%s' "$q"; return 0; }
-  id=$(slugify "$q"); [ -f "$(lib_file "$id")" ] && { printf '%s' "$id"; return 0; }
+  local q="$1" f id lq
+  case "$q" in */*|"") ;; *) [ -f "$(lib_file "$q")" ] && { printf '%s' "$q"; return 0; } ;; esac
+  lq=$(printf '%s' "$q" | tr '[:upper:]' '[:lower:]')
   for f in "$LIBRARY"/*.app.conf; do
     [ -f "$f" ] || continue
-    if [ "$(conf_get "$f" name | tr '[:upper:]' '[:lower:]')" = "$(printf '%s' "$q" | tr '[:upper:]' '[:lower:]')" ]; then
+    if [ "$(conf_get "$f" name | tr '[:upper:]' '[:lower:]')" = "$lq" ]; then
       basename "$f" .app.conf; return 0
     fi
   done
+  id=$(slugify "$q"); [ -n "$id" ] && [ -f "$(lib_file "$id")" ] && { printf '%s' "$id"; return 0; }
   return 1
 }
 
@@ -987,9 +1059,9 @@ cmd_install() { # installer [--bottle B] [--name N] [--preset P]
   local installer="" bottle="" name="" preset=""
   while [ $# -gt 0 ]; do
     case "$1" in
-      --bottle) bottle="${2:-}"; shift 2 ;;
-      --name) name="${2:-}"; shift 2 ;;
-      --preset) preset="${2:-}"; shift 2 ;;
+      --bottle) need_value "$@"; bottle="$2"; shift 2 ;;
+      --name) need_value "$@"; name="$2"; shift 2 ;;
+      --preset) need_value "$@"; preset="$2"; shift 2 ;;
       *) installer="$1"; shift ;;
     esac
   done
@@ -1001,6 +1073,8 @@ cmd_install() { # installer [--bottle B] [--name N] [--preset P]
       installer="$CACHE/downloads/$fname" ;;
   esac
   [ -f "$installer" ] || die "no such file: $installer"
+  # The installer runs from its own folder, so a relative path has to be made absolute first.
+  installer="$(cd "$(dirname "$installer")" && pwd)/$(basename "$installer")"
   local base; base=$(basename "$installer"); base="${base%.*}"
   [ -n "$bottle" ] || bottle="${name:-$base}"
   if ! bottle_exists "$bottle"; then cmd_bottle_create "$bottle" "$preset"
@@ -1015,6 +1089,7 @@ cmd_install() { # installer [--bottle B] [--name N] [--preset P]
     *.msi|*.MSI) "$WINE" msiexec /i "$installer" >"$log" 2>&1 ;;
     *) (cd "$(dirname "$installer")" && "$WINE" "$installer" >"$log" 2>&1) ;;
   esac
+  say "${D}Waiting for the installer, and anything it started, to close…${N}"
   "$WINESERVER" -w 2>/dev/null
   list_shortcuts "$WINEPREFIX" > "$after"
 
@@ -1042,9 +1117,9 @@ cmd_add() { # name --bottle B --exe PATH [--args A]
   shift || true
   while [ $# -gt 0 ]; do
     case "$1" in
-      --bottle) bottle="${2:-}"; shift 2 ;;
-      --exe) exe="${2:-}"; shift 2 ;;
-      --args) args="${2:-}"; shift 2 ;;
+      --bottle) need_value "$@"; bottle="$2"; shift 2 ;;
+      --exe) need_value "$@"; exe="$2"; shift 2 ;;
+      --args) need_value "$@"; args="$2"; shift 2 ;;
       *) die "unknown option $1" ;;
     esac
   done
@@ -1074,12 +1149,12 @@ cmd_remove() {
 
 cmd_launch() { # app [--graphics G] [-- extra args]
   local q="${1:-}"; shift || true
-  local graphics="" extra=""
+  local graphics="" extra=()
   while [ $# -gt 0 ]; do
     case "$1" in
-      --graphics) graphics="${2:-}"; shift 2 ;;
-      --) shift; extra="$*"; break ;;
-      *) extra="$extra $1"; shift ;;
+      --graphics) need_value "$@"; graphics="$2"; shift 2 ;;
+      --) shift; extra+=("$@"); break ;;
+      *) extra+=("$1"); shift ;;
     esac
   done
   local id f; id=$(lib_find "$q") || die "no app called '$q' (see: burrow apps)"
@@ -1096,9 +1171,29 @@ cmd_launch() { # app [--graphics G] [-- extra args]
     local v; for v in $BURROW_USER_ENV; do printf '%s=%s\n' "$v" "$(printenv "$v")"; done; } > "$log"
   step "Starting $name ($BOTTLE_ENGINE)…  log: $log"
   # `start /wait` follows .lnk shortcuts and sets the program's own folder as the working dir.
-  # shellcheck disable=SC2086
-  "$WINE" start /wait "$target" $args $extra >>"$log" 2>&1 &
+  split_args "$args"
+  "$WINE" start /wait "$target" ${SPLIT_ARGS[@]+"${SPLIT_ARGS[@]}"} ${extra[@]+"${extra[@]}"} >>"$log" 2>&1 &
   [ "${BURROW_FOREGROUND:-0}" = 1 ] && wait
+  return 0
+}
+
+# Splits saved launch options the way Windows does: spaces separate, "double quotes" group,
+# and nothing is expanded (no * globbing, no $variables). Result in SPLIT_ARGS.
+split_args() { # text
+  SPLIT_ARGS=()
+  local s="$1" cur="" inq=0 have=0 c i tab; tab=$(printf '\t')
+  for ((i = 0; i < ${#s}; i++)); do
+    c="${s:i:1}"
+    if [ "$c" = '"' ]; then
+      inq=$((1 - inq)); have=1
+    elif [ "$inq" = 0 ] && { [ "$c" = " " ] || [ "$c" = "$tab" ]; }; then
+      [ "$have" = 1 ] && SPLIT_ARGS+=("$cur")
+      cur=""; have=0
+    else
+      cur="$cur$c"; have=1
+    fi
+  done
+  [ "$have" = 1 ] && SPLIT_ARGS+=("$cur")
   return 0
 }
 
@@ -1162,7 +1257,16 @@ cmd_steam_install() {
 
 steam_exe_win() { if [ -f "$(steam_root)/Steam.exe" ]; then printf '%s\\Steam.exe' "$STEAM_DIR_WIN"; else printf '%s\\steam.exe' "$STEAM_DIR_WIN"; fi; }
 
-steam_running() { [ -f "$BOTTLES/$STEAM_BOTTLE/.steam-running" ] && kill -0 "$(cat "$BOTTLES/$STEAM_BOTTLE/.steam-running")" 2>/dev/null; }
+# The PID is Burrow's own Steam subshell. After a crash or restart the file can outlive it and the
+# number can belong to something else, so the process must still be Burrow, or the file is stale.
+steam_running() {
+  local f="$BOTTLES/$STEAM_BOTTLE/.steam-running" pid
+  [ -f "$f" ] || return 1
+  pid=$(cat "$f" 2>/dev/null)
+  case "$pid" in ""|*[!0-9]*) rm -f "$f"; return 1 ;; esac
+  if kill -0 "$pid" 2>/dev/null && ps -p "$pid" -o command= 2>/dev/null | grep -q burrow; then return 0; fi
+  rm -f "$f"; return 1
+}
 
 cmd_steam_open() { # [extra steam args]
   cmd_steam_install
@@ -1172,7 +1276,7 @@ cmd_steam_open() { # [extra steam args]
     "$WINE" "$(steam_exe_win)" "$@" >/dev/null 2>&1 &
     return 0
   fi
-  [ "$BOTTLE_ENGINE" = "$TURBO_ENGINE" ] || warn "Turbo graphics isn't built, so 3D games will be slow or fail. Run: burrow turbo"
+  [ "$BOTTLE_ENGINE" = "$TURBO_ENGINE" ] || ! turbo_usable || warn "Turbo graphics isn't built, so 3D games will be slow or fail. Run: burrow turbo"
   wrap_webhelpers
   local log flag; log=$(new_log steam); flag="$BOTTLES/$STEAM_BOTTLE/.steam-closed"
   rm -f "$flag"
@@ -1217,7 +1321,7 @@ $real"
       [ -f "$f" ] || continue
       local id name dir
       id=$(sed -n 's/^[[:space:]]*"appid"[[:space:]]*"\([0-9]*\)".*/\1/p' "$f" | head -1)
-      name=$(sed -n 's/^[[:space:]]*"name"[[:space:]]*"\(.*\)"[[:space:]]*$/\1/p' "$f" | head -1)
+      name=$(sed -n 's/^[[:space:]]*"name"[[:space:]]*"\(.*\)"[[:space:]]*$/\1/p' "$f" | head -1 | sed -e 's/\\"/"/g' -e 's/\\\\/\\/g')
       dir=$(sed -n 's/^[[:space:]]*"installdir"[[:space:]]*"\(.*\)"[[:space:]]*$/\1/p' "$f" | head -1)
       # Skip Steam's own runtimes (Steamworks redistributables, Proton, etc.).
       case "$id" in 228980|1070560|1391110|1628350) continue ;; esac
@@ -1247,8 +1351,7 @@ cmd_steam_sync() {
   while IFS="$(printf '\t')" read -r id name dir; do
     [ -n "$id" ] || continue
     grep -qxF "steam_appid=$id" "$LIBRARY"/*.app.conf 2>/dev/null && continue
-    local lid; lid=$(lib_add "$name" "$STEAM_BOTTLE" "steam://rungameid/$id")
-    conf_set "$(lib_file "$lid")" steam_appid "$id"
+    lib_add "$name" "$STEAM_BOTTLE" "steam://rungameid/$id" "" "$id" >/dev/null
     ok "Added $name"; added=$((added + 1))
   done < <(printf '%s\n' "$out")
   [ "$added" -gt 0 ] || say "Your Steam games are already in the library."
@@ -1300,6 +1403,9 @@ cmd_shortcut() { # app
 cmd_app() { # builds Burrow.app: the windowed app, or the simple menu if Swift isn't available
   is_mac || die "Burrow.app is made on the Mac"
   local dest="${1:-$HOME/Applications/Burrow.app}"
+  # The old app at dest is replaced, so dest must be an app, never a folder like ~/Applications.
+  case "$dest" in *.app|*.app/) dest="${dest%/}" ;; *) die "give the app's path, ending in .app (e.g. ~/Applications/Burrow.app)" ;; esac
+  [ ! -e "$dest" ] || [ -d "$dest/Contents" ] || die "$dest exists and isn't an app; not replacing it"
   mkdir -p "$(dirname "$dest")"
   if [ "${BURROW_MENU_APP:-0}" != 1 ] && build_window_app "$dest"; then
     ok "Made $dest"
@@ -1319,11 +1425,21 @@ build_window_app() { # dest
   fi
   local major; major=$(sw_vers -productVersion | cut -d. -f1)
   if [ "$major" -lt 13 ]; then warn "the Burrow window needs macOS 13 or newer; using the simple menu"; return 1; fi
+  # .formStyle(.grouped) and friends need the macOS 13 SDK; old Command Line Tools have an older one.
+  local sdk; sdk=$(xcrun --sdk macosx --show-sdk-version 2>/dev/null | cut -d. -f1)
+  if [ -n "$sdk" ] && [ "$sdk" -lt 13 ] 2>/dev/null; then
+    warn "Apple's Command Line Tools here are too old for the Burrow window (macOS $sdk SDK); using the simple menu."
+    warn "Update them in System Settings > General > Software Update, then run: burrow app"
+    return 1
+  fi
+  # Built for the hardware, so the window (and everything it runs) isn't stuck under Rosetta
+  # when Terminal happens to be.
+  local arch=x86_64; apple_silicon && arch=arm64
   step "Building the Burrow window app…"
   local tmp; tmp=$(mktemp -d -t burrow-app) || return 1
   local log="$LOGS/app-build.log"
   # Through xcrun so swiftc is told where the macOS SDK is; run bare it can't find it.
-  if ! xcrun --sdk macosx swiftc -O -swift-version 5 -parse-as-library -target "$(uname -m)-apple-macos13.0" \
+  if ! xcrun --sdk macosx swiftc -O -swift-version 5 -parse-as-library -target "$arch-apple-macos13.0" \
         "$src" -o "$tmp/Burrow" > "$log" 2>&1; then
     warn "The window app didn't compile (details in $log); using the simple menu."
     rm -rf "$tmp"
@@ -1332,34 +1448,8 @@ build_window_app() { # dest
   local app="$tmp/Burrow.app"
   mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources"
   mv "$tmp/Burrow" "$app/Contents/MacOS/Burrow"
-  cat > "$app/Contents/Info.plist" <<PLIST
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-  <key>CFBundleName</key><string>Burrow</string>
-  <key>CFBundleDisplayName</key><string>Burrow</string>
-  <key>CFBundleIdentifier</key><string>com.swollzy.burrow</string>
-  <key>CFBundleExecutable</key><string>Burrow</string>
-  <key>CFBundlePackageType</key><string>APPL</string>
-  <key>CFBundleShortVersionString</key><string>$BURROW_VERSION</string>
-  <key>CFBundleVersion</key><string>$BURROW_VERSION</string>
-  <key>LSMinimumSystemVersion</key><string>13.0</string>
-  <key>LSApplicationCategoryType</key><string>public.app-category.games</string>
-  <key>NSHighResolutionCapable</key><true/>
-  <key>NSAppleEventsUsageDescription</key><string>Burrow opens Terminal to install Homebrew.</string>
-  <key>CFBundleDocumentTypes</key>
-  <array>
-    <dict>
-      <key>CFBundleTypeName</key><string>Windows Program</string>
-      <key>CFBundleTypeRole</key><string>Viewer</string>
-      <key>LSHandlerRank</key><string>Alternate</string>
-      <key>CFBundleTypeExtensions</key><array><string>exe</string><string>msi</string></array>
-    </dict>
-  </array>
-</dict>
-</plist>
-PLIST
+  # app/Info.plist is shared with the DMG build (dmg/stage.sh).
+  sed "s/__VERSION__/$BURROW_VERSION/g" "$APPDIR/app/Info.plist" > "$app/Contents/Info.plist"
   # Ad-hoc signature so Apple Silicon runs it; made on this Mac, so no quarantine.
   codesign --force --deep -s - "$app" >/dev/null 2>&1 || true
   rm -rf "$dest"
@@ -1380,19 +1470,276 @@ build_menu_app() { # dest
   ok "Made $dest (simple menu)"
 }
 
+# --- Cleanup after an update ---------------------------------------------------------------------
+# Removes what earlier versions of Burrow left behind: Wine engines, DXMT and winetricks for
+# versions Burrow no longer uses, their downloads and turbo build trees, half-finished
+# downloads and installs, old logs, and an older copy of Burrow.app in the other Applications
+# folder. Bottles, games, snapshots, the library, settings and shortcuts are never touched.
+VERSION_MARKER="$BURROW_HOME/.burrow-version"
+
+CLEAN_KB=0; CLEAN_N=0; CLEAN_DRY=0; CLEAN_QUIET=0; CLEAN_TITLE="Cleaning up files from older versions of Burrow…"
+clean_note() { # path why: counts it and says what goes
+  local kb shown="$1"; kb=$(kb_size "$1")
+  case "$1" in "$HOME"/*) shown="~${1#"$HOME"}" ;; esac
+  CLEAN_KB=$((CLEAN_KB + ${kb:-0})); CLEAN_N=$((CLEAN_N + 1))
+  if [ "$CLEAN_QUIET" = 0 ]; then
+    [ "$CLEAN_N" = 1 ] && step "$CLEAN_TITLE"
+    say "  $2: $shown ($(human_kb "${kb:-0}"))"
+  fi
+}
+clean_path() { # path why
+  [ -e "$1" ] || [ -L "$1" ] || return 0
+  clean_note "$1" "$2"
+  [ "$CLEAN_DRY" = 1 ] || rm -rf "$1"
+}
+# Like clean_path, but to the Trash: people look for a removed app there.
+trash_path() { # path why
+  [ -e "$1" ] || return 0
+  clean_note "$1" "$2"
+  [ "$CLEAN_DRY" = 1 ] && return 0
+  local to; to="$HOME/.Trash/$(basename "$1")"
+  [ ! -e "$to" ] || to="$HOME/.Trash/$(basename "$1" .app) $(date +%H.%M.%S).app"
+  mv "$1" "$to" 2>/dev/null \
+    || osascript -e "tell application \"Finder\" to delete (POSIX file \"$(applescript_quote "$1")\")" >/dev/null 2>&1 \
+    || warn "couldn't move $1 to the Trash; drag it there yourself"
+}
+
+# Temp files named with a process id (.extract.123, file.tmp.123) are stale once it has exited.
+clean_pid_temps() { # glob-prefix why   (files are <prefix><pid>)
+  local f pid
+  for f in "$1"*; do
+    [ -e "$f" ] || continue
+    pid="${f##*.}"
+    case "$pid" in ""|*[!0-9]*) continue ;; esac
+    kill -0 "$pid" 2>/dev/null || clean_path "$f" "$2"
+  done
+}
+
+# Other things in progress (a download, a copy) are stale after an hour untouched.
+clean_stale() { # dir name-pattern why
+  [ -d "$1" ] || return 0
+  local f
+  while IFS= read -r f; do clean_path "$f" "$3"; done < <(find "$1" -maxdepth 1 -name "$2" -mmin +60 2>/dev/null)
+}
+
+bundle_id() { /usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$1/Contents/Info.plist" 2>/dev/null; }
+
+cmd_cleanup() { # [--dry-run] [--quiet] [--keep-app PATH] [--if-updated]
+  local keep_app="" if_updated=0
+  CLEAN_KB=0; CLEAN_N=0; CLEAN_DRY=0; CLEAN_QUIET=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --dry-run|-n) CLEAN_DRY=1; shift ;;
+      --quiet|-q) CLEAN_QUIET=1; shift ;;
+      --keep-app) need_value "$@"; keep_app="${2%/}"; shift 2 ;;
+      --if-updated) if_updated=1; shift ;;
+      *) die "unknown option '$1' (burrow cleanup [--dry-run] [--quiet] [--keep-app PATH])" ;;
+    esac
+  done
+  if [ "$if_updated" = 1 ] && [ "$(cat "$VERSION_MARKER" 2>/dev/null)" = "$BURROW_VERSION" ]; then return 0; fi
+
+  # Half-finished work: installs, downloads, unpacking, settings writes.
+  clean_stale "$BURROW_HOME" 'app.new' "unfinished update"
+  clean_pid_temps "$ENGINES/.extract." "unfinished unpack"
+  clean_pid_temps "$RUNTIMES/.extract." "unfinished unpack"
+  clean_stale "$ENGINES" '*.new' "unfinished turbo build"
+  clean_stale "$CACHE" '*.part' "unfinished download"
+  clean_stale "$CACHE/downloads" '*.part' "unfinished download"
+  clean_pid_temps "$CACHE/lnk-before." "leftover temp file"
+  clean_pid_temps "$CACHE/lnk-after." "leftover temp file"
+  clean_pid_temps "$LIBRARY/" "leftover temp file"   # only matches *.tmp.<pid>, the one kind ending in a number
+  local d f
+  for d in "$BOTTLES"/*/; do [ -d "$d" ] && clean_pid_temps "${d}bottle.conf.tmp." "leftover temp file"; done
+
+  # Engines and runtimes for versions this Burrow doesn't use. Wine can't have its files pulled
+  # out from under a running program, so engines wait while anything runs.
+  if [ -n "$(running_procs)" ]; then
+    [ "$CLEAN_QUIET" = 1 ] || say "  (Windows programs are running, so old Wine engines are left for next time.)"
+  else
+    for d in "$ENGINES"/*/; do
+      [ -d "$d" ] || continue
+      case "$(basename "$d")" in "$STOCK_ENGINE"|"$TURBO_ENGINE"|.*) ;; *) clean_path "${d%/}" "old Wine engine" ;; esac
+    done
+  fi
+  for d in "$RUNTIMES"/dxmt-*/; do
+    [ -d "$d" ] && [ "$(basename "$d")" != "dxmt-$DXMT_VERSION" ] && clean_path "${d%/}" "old DXMT"
+  done
+  for f in "$RUNTIMES"/winetricks-*; do
+    [ -e "$f" ] && [ "$(basename "$f")" != "winetricks-$WINETRICKS_VERSION" ] && clean_path "$f" "old winetricks"
+  done
+  for f in "$CACHE"/wine-devel-*-osx64.tar.xz; do
+    [ -f "$f" ] && [ "$(basename "$f")" != "wine-devel-$WINE_VERSION-osx64.tar.xz" ] && clean_path "$f" "old Wine download"
+  done
+  for f in "$CACHE"/dxmt-*-builtin.tar.gz; do
+    [ -f "$f" ] && [ "$(basename "$f")" != "dxmt-$DXMT_VERSION-builtin.tar.gz" ] && clean_path "$f" "old DXMT download"
+  done
+  # Before 0.3.1 turbo was built here, which never worked (the path has a space).
+  [ "${BURROW_TURBO_WORK:-}" = "$CACHE/turbo" ] || clean_path "$CACHE/turbo" "old turbo build folder"
+  local work; work=$(turbo_workdir 2>/dev/null) || work=""
+  if [ -n "$work" ] && [ -d "$work" ]; then
+    for d in "$work"/wine-* "$work"/build-*; do
+      [ -e "$d" ] || continue
+      case "$(basename "$d")" in "wine-$WINE_VERSION"|"wine-$WINE_VERSION.tar.xz"|"build-$WINE_VERSION") ;; *) clean_path "$d" "old turbo build files" ;; esac
+    done
+  fi
+
+  # Logs older than 30 days (recent ones are what to send when something fails).
+  if [ -d "$LOGS" ]; then
+    while IFS= read -r f; do clean_path "$f" "old log"; done < <(find "$LOGS" -maxdepth 1 -name '*.log' -mtime +30 2>/dev/null)
+  fi
+
+  # An older Burrow.app in the other Applications folder (install.sh puts it in ~/Applications,
+  # the DMG in /Applications). Only when the copy being kept is itself an installed one: a copy
+  # run straight from the DMG, or one macOS moved to a temporary place, keeps everything.
+  if is_mac && [ -n "$keep_app" ] && [ -d "$keep_app" ]; then
+    case "$keep_app" in
+      /Applications/*|"$HOME/Applications/"*)
+        local other
+        for other in /Applications/Burrow.app "$HOME/Applications/Burrow.app"; do
+          [ "$other" = "$keep_app" ] && continue
+          [ -d "$other" ] && [ "$(bundle_id "$other")" = "com.swollzy.burrow" ] && clean_path "$other" "older copy of Burrow"
+        done ;;
+    esac
+  fi
+
+  if [ "$CLEAN_DRY" = 0 ]; then printf '%s\n' "$BURROW_VERSION" > "$VERSION_MARKER" 2>/dev/null || true; fi
+  if [ "$CLEAN_QUIET" = 0 ]; then
+    if [ "$CLEAN_N" = 0 ]; then [ "$if_updated" = 1 ] || ok "Nothing to clean up"
+    elif [ "$CLEAN_DRY" = 1 ]; then ok "Would free $(human_kb "$CLEAN_KB") ($CLEAN_N items)"
+    else ok "Freed $(human_kb "$CLEAN_KB") ($CLEAN_N items). Your bottles, games and settings weren't touched."; fi
+  fi
+  return 0
+}
+
+# --- Uninstall -----------------------------------------------------------------------------------
+# Takes Burrow off this Mac: Wine, DXMT and winetricks, downloads and turbo build files, logs, the
+# burrow tool and its Terminal command, Dock shortcuts, the window's settings and the permissions
+# macOS gave it, and Burrow.app (to the Trash). Bottles hold the installed games and their saves,
+# so they stay, with the library and snapshots, and installing Burrow again brings them back.
+# --everything deletes those too.
+cmd_uninstall() { # [--everything] [--yes] [--dry-run] [--keep-app PATH]
+  local everything=0 yes=0 keep_app="" d answer
+  CLEAN_KB=0; CLEAN_N=0; CLEAN_DRY=0; CLEAN_QUIET=0; CLEAN_TITLE="Removing Burrow…"
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --everything|--all) everything=1; shift ;;
+      --yes|-y) yes=1; shift ;;
+      --dry-run|-n) CLEAN_DRY=1; shift ;;
+      --keep-app) need_value "$@"; keep_app="${2%/}"; shift 2 ;;   # Burrow.app trashes itself
+      *) die "unknown option '$1' (burrow uninstall [--everything] [--yes] [--dry-run])" ;;
+    esac
+  done
+  case "${BURROW_HOME%/}" in ""|"$HOME"|*/..|*/../*) die "not removing $BURROW_HOME" ;; esac
+
+  if [ "$CLEAN_DRY" = 0 ]; then
+    local busy=""
+    for d in "$BOTTLES"/*/; do
+      [ -d "$d" ] && bottle_has_programs "$(basename "$d")" && busy="$busy${busy:+, }$(basename "$d")"
+    done
+    [ -z "$busy" ] || die "Windows programs are still running in: $busy. Quit them first (Usage tab > Force Quit, or: burrow kill)."
+  fi
+  if [ "$yes" = 0 ] && [ "$CLEAN_DRY" = 0 ]; then
+    [ -t 0 ] || die "add --yes to uninstall without being asked (or --dry-run to see what would go)"
+    local games; games=$(human_kb "$(kb_size "$BOTTLES")")
+    if [ "$everything" = 1 ]; then
+      say "This removes Burrow and deletes every bottle: your installed Windows games and programs, and their saves ($games)."
+      printf 'Type DELETE to go ahead: '; read -r answer || answer=""
+      [ "$answer" = DELETE ] || { say "Nothing was removed."; return 1; }
+    else
+      say "This removes Burrow. Your bottles (installed games and their saves, $games) stay in $BURROW_HOME."
+      printf 'Uninstall Burrow? [y/N] '; read -r answer || answer=""
+      case "$answer" in [yY]*) ;; *) say "Nothing was removed."; return 1 ;; esac
+    fi
+  fi
+
+  # Wine's background processes (wineserver) would keep engine files open.
+  if [ "$CLEAN_DRY" = 0 ]; then
+    for d in "$BOTTLES"/*/; do [ -d "$d/prefix" ] && stop_bottle "$(basename "$d")"; done
+  fi
+  clean_path "$ENGINES" "Wine"
+  clean_path "$RUNTIMES" "DXMT and winetricks"
+  clean_path "$CACHE" "downloads"
+  clean_path "$HOME/Library/Caches/Burrow" "turbo build files"
+  clean_path "$LOGS" "logs"
+  # Dock shortcuts start the burrow tool, which is going. Burrow's own folder goes whole; a
+  # folder chosen with BURROW_SHORTCUTS may hold other apps, so there only Burrow's go.
+  if [ "$SHORTCUTS" = "$HOME/Applications/Burrow" ]; then
+    clean_path "$SHORTCUTS" "Dock shortcuts"
+  else
+    local f
+    for f in "$LIBRARY"/*.app.conf; do
+      [ -f "$f" ] && clean_path "$SHORTCUTS/$(conf_get "$f" name | tr '/:' '--').app" "Dock shortcut"
+    done
+  fi
+  clean_path "$BURROW_HOME/app" "the burrow tool"
+  clean_path "$BURROW_HOME/app.new" "the burrow tool"
+  [ "$CLEAN_DRY" = 1 ] || rm -f "$VERSION_MARKER"
+  local link="$HOME/.local/bin/burrow"
+  if [ -L "$link" ]; then
+    case "$(readlink "$link")" in "$BURROW_HOME/app/"*) clean_path "$link" "the burrow command in Terminal" ;; esac
+  fi
+  # install.sh put ~/.local/bin on the PATH. When nothing else lives there, that line goes too.
+  if [ "$CLEAN_DRY" = 0 ] && [ ! -L "$link" ] && rmdir "$HOME/.local/bin" 2>/dev/null; then
+    local rc
+    for rc in "$HOME/.zprofile" "$HOME/.bash_profile"; do
+      [ -f "$rc" ] && grep -q '# added by Burrow$' "$rc" || continue
+      { grep -v '# added by Burrow$' "$rc" || true; } > "$rc.burrow-tmp" && cat "$rc.burrow-tmp" > "$rc"
+      rm -f "$rc.burrow-tmp"
+    done
+  fi
+  if is_mac; then
+    [ "$CLEAN_DRY" = 1 ] || defaults delete com.swollzy.burrow >/dev/null 2>&1 || true
+    clean_path "$HOME/Library/Preferences/com.swollzy.burrow.plist" "window settings"
+    clean_path "$HOME/Library/Saved Application State/com.swollzy.burrow.savedState" "window settings"
+    clean_path "$HOME/Library/Caches/com.swollzy.burrow" "caches"
+    clean_path "$HOME/Library/HTTPStorages/com.swollzy.burrow" "caches"
+    # Folder access and the like, so a later install asks again instead of inheriting it.
+    [ "$CLEAN_DRY" = 1 ] || tccutil reset All com.swollzy.burrow >/dev/null 2>&1 || true
+    local a
+    for a in /Applications/Burrow.app "$HOME/Applications/Burrow.app"; do
+      [ "$a" = "$keep_app" ] && continue
+      [ -d "$a" ] && [ "$(bundle_id "$a")" = com.swollzy.burrow ] && trash_path "$a" "Burrow (to the Trash)"
+    done
+  fi
+
+  if [ "$everything" = 1 ]; then
+    clean_path "$BOTTLES" "bottles: installed games and programs, and their saves"
+    clean_path "$SNAPSHOTS" "snapshots"
+    clean_path "$LIBRARY" "library"
+    [ "$CLEAN_DRY" = 1 ] || rm -rf "$BURROW_HOME"
+  elif [ "$CLEAN_DRY" = 0 ]; then
+    # Folders with nothing in them aren't worth keeping.
+    rmdir "$BOTTLES" "$LIBRARY" "$SNAPSHOTS" 2>/dev/null
+    rmdir "$BURROW_HOME" 2>/dev/null
+  fi
+
+  if [ "$CLEAN_DRY" = 1 ]; then
+    ok "Uninstalling would free $(human_kb "$CLEAN_KB") ($CLEAN_N items)$([ "$everything" = 1 ] || printf '. Bottles, games and the library would stay.')"
+  elif [ "$everything" = 1 ]; then
+    ok "Burrow is uninstalled, with its bottles and games. Freed $(human_kb "$CLEAN_KB")."
+  else
+    ok "Burrow is uninstalled. Freed $(human_kb "$CLEAN_KB")."
+    [ -d "$BURROW_HOME" ] && say "Your bottles and games ($(human_kb "$(kb_size "$BURROW_HOME")")) are still in $BURROW_HOME. Install Burrow again to play them, or delete that folder to free the space."
+  fi
+  return 0
+}
+
 # --- Housekeeping ----------------------------------------------------------------------------------
 cmd_doctor() {
   step "Burrow $BURROW_VERSION doctor"
   if is_mac; then
-    say "macOS $(sw_vers -productVersion) on $(uname -m)"
-    if [ "$(uname -m)" = arm64 ]; then
+    local hw=Intel; apple_silicon && hw="Apple Silicon"
+    say "macOS $(sw_vers -productVersion) on $hw$([ "$(sysctl -n sysctl.proc_translated 2>/dev/null)" = 1 ] && printf ' (this Terminal runs under Rosetta)')"
+    if apple_silicon; then
       /usr/bin/arch -x86_64 /usr/bin/true 2>/dev/null && ok "Rosetta 2" || warn "Rosetta 2 missing (burrow setup installs it)"
     fi
     [ -d /Library/Frameworks/GStreamer.framework ] && ok "GStreamer (in-game video)" || warn "GStreamer missing: game intro videos may be black"
   fi
   engine_ok "$STOCK_ENGINE" && ok "Wine $WINE_VERSION" || warn "Wine missing: burrow setup"
   [ -d "$RUNTIMES/dxmt-$DXMT_VERSION/x86_64-windows" ] && ok "DXMT $DXMT_VERSION downloaded" || warn "DXMT missing: burrow setup"
-  engine_ok "$TURBO_ENGINE" && ok "Turbo graphics built" || warn "Turbo graphics not built: burrow turbo"
+  if ! turbo_usable; then say "Turbo graphics: needs Apple Silicon; this Mac uses compatible graphics"
+  elif engine_ok "$TURBO_ENGINE"; then ok "Turbo graphics built"
+  else warn "Turbo graphics not built: burrow turbo"; fi
   if bottle_exists "$STEAM_BOTTLE"; then
     [ -f "$(steam_root)/steam.exe" ] || [ -f "$(steam_root)/Steam.exe" ] && ok "Windows Steam installed" || warn "Steam bottle exists but Steam isn't installed: burrow steam install"
     local unwrapped; unwrapped=$(find "$(steam_root)/bin/cef" -name steamwebhelper.exe 2>/dev/null | while IFS= read -r f; do grep -aq "$WRAPPER_MARKER" "$f" || echo "$f"; done)
@@ -1509,21 +1856,33 @@ cmd_tools() {
   is_mac || die "this is for the Mac"
   if xcode-select -p >/dev/null 2>&1; then ok "Apple's Command Line Tools are installed"; return 0; fi
   xcode-select --install 2>/dev/null || true
-  say "Click Install in the window that opened. When it finishes, come back and continue."
+  say "Click Install in the window that opened. Burrow waits until it's done (usually 5-15 minutes)."
+  local waited=0
+  until xcode-select -p >/dev/null 2>&1; do
+    sleep 10; waited=$((waited + 10))
+    [ $((waited % 120)) = 0 ] && say "${D}  still waiting for the Command Line Tools…${N}"
+    [ "$waited" -ge 3600 ] && die "the Command Line Tools still aren't installed; press Install again when you're ready"
+  done
+  ok "Apple's Command Line Tools are installed"
 }
 
-# One line of flags for Burrow.app: "setup=1 turbo=0 steam=1 clt=1 brew=0 gst=0 mac=1 arm=1".
+# One line of flags for Burrow.app: "setup=1 turbo=0 steam=1 clt=1 brew=0 gst=0 mac=1 arm=1 rosetta=1 macos=15".
 cmd_status() {
-  local s=0 t=0 st=0 clt=0 brew=0 gst=0 mac=0 arm=0
+  local s=0 t=0 st=0 clt=0 brew=0 gst=0 mac=0 arm=0 rosetta=1 macos=0
   { [ -n "${BURROW_WINE:-}" ] || engine_ok "$STOCK_ENGINE"; } && [ -d "$RUNTIMES/dxmt-$DXMT_VERSION/x86_64-windows" ] && s=1
   engine_ok "$TURBO_ENGINE" && t=1
   { [ -f "$(steam_root)/steam.exe" ] || [ -f "$(steam_root)/Steam.exe" ]; } && st=1
   is_mac && mac=1
-  [ "$(uname -m)" = arm64 ] && arm=1
+  apple_silicon && arm=1
+  if is_mac; then
+    macos=$(mac_major); macos=${macos:-0}
+    [ "$arm" = 1 ] && { /usr/bin/arch -x86_64 /usr/bin/true 2>/dev/null || rosetta=0; }
+  fi
   is_mac && xcode-select -p >/dev/null 2>&1 && clt=1
   { [ -x /opt/homebrew/bin/brew ] || [ -x /usr/local/bin/brew ]; } && brew=1
   [ -d /Library/Frameworks/GStreamer.framework ] && gst=1
-  printf 'setup=%s turbo=%s steam=%s clt=%s brew=%s gst=%s mac=%s arm=%s\n' "$s" "$t" "$st" "$clt" "$brew" "$gst" "$mac" "$arm"
+  printf 'setup=%s turbo=%s steam=%s clt=%s brew=%s gst=%s mac=%s arm=%s rosetta=%s macos=%s\n' \
+    "$s" "$t" "$st" "$clt" "$brew" "$gst" "$mac" "$arm" "$rosetta" "$macos"
 }
 
 cmd_kill() { # [bottle] stops every program in a bottle (or all bottles)
@@ -1568,6 +1927,8 @@ ${B}Burrow $BURROW_VERSION${N}: Windows programs and Windows Steam on your Mac.
   burrow usage                     disk space per bottle and game, and RAM of running programs
   burrow usage --ram               just the memory of running programs
   burrow doctor                    check everything
+  burrow cleanup [--dry-run]       remove files older versions left behind (bottles stay)
+  burrow uninstall [--everything]  remove Burrow; bottles (games, saves) stay unless --everything
   burrow app                       (re)build Burrow.app, the window app
 
 Files live in: $BURROW_HOME
@@ -1600,6 +1961,8 @@ main() {
     winecfg|wine-settings) cmd_winecfg "$@" ;;
     kill|stop) cmd_kill "$@" ;;
     doctor) cmd_doctor ;;
+    cleanup|clean) cmd_cleanup "$@" ;;
+    uninstall) cmd_uninstall "$@" ;;
     app) cmd_app "$@" ;;
     version|--version|-v) say "burrow $BURROW_VERSION" ;;
     help|--help|-h) usage ;;

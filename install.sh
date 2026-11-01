@@ -52,6 +52,10 @@ fi
 
 "$dest/bin/burrow" app "$HOME/Applications/Burrow.app"
 
+# An update: clear out what older versions left (old Wine engines and downloads, an older
+# Burrow.app in /Applications). Bottles, games and settings stay.
+"$dest/bin/burrow" cleanup --if-updated --keep-app "$HOME/Applications/Burrow.app" || true
+
 echo
 echo "Done. Burrow is in your Applications folder (~/Applications/Burrow.app); drag it to your Dock."
 echo "Opening it now. Start on the Setup tab."

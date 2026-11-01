@@ -55,6 +55,63 @@ The window has five tabs:
   program, grouped by bottle, with Quit buttons.
 - **Setup**: each step with a check mark, plus "Check Everything" and the logs folder.
 
+**Burrow > Settings** (⌘,) turns notifications on or off and has **Uninstall Burrow…**.
+
+- **Notifications**: when Wine setup, the turbo build, an install or another long job finishes
+  or stops with an error while you're in another app, Burrow says so in Notification Center
+  (macOS asks once, the first time a job starts). Clicking an error opens its details.
+- **Permissions**: Windows programs see your Documents, Desktop and Downloads folders as their
+  own, so macOS asks before Burrow uses them, saying why. A signed Burrow keeps those answers
+  across updates.
+
+## Share it as a DMG (no Terminal for friends)
+
+On your Mac, download this repo (**Code → Download ZIP**, or `git clone`) and double-click
+**Make DMG.command**. It compiles the Burrow window for Apple Silicon and Intel, puts the
+command-line tool inside the app, signs it and writes `~/Desktop/DMGs/Burrow-<version>.dmg`:
+a window with Burrow, an arrow, the Applications folder and a "Read Me First".
+
+- If macOS won't open the `.command`: System Settings > Privacy & Security > **Open Anyway**,
+  or in Terminal type `bash ` and drag the file in.
+- The first time, macOS asks whether Terminal may control Finder. Click **OK**: that lays out
+  the DMG window. Saying no still makes a working, plain-looking DMG.
+- With the paid Apple Developer account, double-click **Set Up Signing.command** once (Make
+  DMG also offers it). It makes the Developer ID Application certificate if the keychain has
+  none (it writes a request file to the Desktop and opens Apple's page: pick **Developer ID
+  Application**, upload the file, click Download), saves the notary login (Apple ID plus an
+  app-specific password from account.apple.com) in the keychain as notarytool profile
+  `Swollzy`, and writes `~/Library/Application Support/Swollzy/signing.conf` (no passwords).
+  From then on each DMG is signed with the hardened runtime, notarized by Apple and stapled,
+  and friends just drag and open it. If Apple says no, the DMG is deleted and the reason is in
+  `~/Desktop/DMGs/Burrow-notarize.log`. One setup covers Wallflower, Swivel and Molt too: they
+  share `dmg/signing.sh`.
+- Without that setup the app is ad-hoc signed, and friends do macOS's one-time **Open Anyway**
+  step (the Read Me walks through it).
+- On first launch Burrow copies its tool to `~/Library/Application Support/Burrow/app`, the
+  same place `install.sh` uses.
+- Build errors go to `~/Desktop/DMGs/Burrow-build-error.log`. A new build removes the older
+  `Burrow-*.dmg` files in that folder.
+
+## Updating
+
+Install the new version the same way (the DMG, or `install.sh`). The first time it runs,
+Burrow cleans up what older versions left behind: Wine engines and DXMT versions it no longer
+uses, their downloads and turbo build files, half-finished downloads, logs older than 30 days,
+and an older copy of Burrow.app in the other Applications folder. Your bottles, games,
+snapshots, library, settings and shortcuts stay. Old Wine engines wait while Windows programs
+are running. Run it yourself with `burrow cleanup` (`--dry-run` lists what it would remove) or
+**Clean Up Old Files** on the Setup tab.
+
+## Uninstalling
+
+**Burrow > Settings > Uninstall Burrow…**, or `burrow uninstall` in Terminal (`--dry-run` lists
+what it would remove). It removes Wine, DXMT and winetricks, the downloads and turbo build
+files, logs, the `burrow` command, Dock shortcuts, the window's settings, the permissions macOS
+gave Burrow, and Burrow.app (to the Trash). Your bottles hold your installed games and their
+saves, so they stay, with the library and snapshots: installing Burrow again brings them back.
+Tick **Also delete my games and bottles** (asked twice), or add `--everything`, to delete those
+too. Windows programs have to be closed first.
+
 ## Bottles: lightweight Windows VMs
 
 A bottle is a private Windows install: its own C: drive, registry, settings and programs.
@@ -141,6 +198,8 @@ burrow shortcut <app>          make a Mac app for it in ~/Applications/Burrow
 burrow usage                   disk space per bottle and game, RAM of running programs
 burrow usage --ram             just the memory of running programs
 burrow doctor                  check everything
+burrow cleanup [--dry-run]     remove files older versions left behind (bottles stay)
+burrow uninstall [--everything] remove Burrow; bottles (games, saves) stay unless --everything
 burrow kill                    force-quit Windows programs
 
 burrow bottle new NAME --preset apps    a new bottle (also: list, clone, delete)
@@ -187,17 +246,24 @@ logs). Each launch writes a log to `logs/` there, which is what to send when a g
   doesn't allow us to ship it and it only runs on older CrossOver-based Wine. A later
   version could use a copy you download from Apple yourself.
 - Rosetta 2 is being phased out after macOS 27 (Apple is keeping a subset for games).
+- Intel Macs: Windows programs run, but turbo graphics (DXMT) needs Apple Silicon, so Burrow
+  doesn't offer it there and games use compatible graphics (wined3d). Older and 2D games are
+  fine; most new 3D games won't run.
 
 ## Development
 
 ```
 bin/burrow                 the whole CLI (bash 3.2, as shipped with macOS)
 app/BurrowApp.swift        the SwiftUI window; runs bin/burrow for everything
+app/Info.plist             the window app's Info.plist (install.sh and the DMG both use it)
 app/Burrow.applescript     fallback menu when the window can't be compiled
 engine/wine-patches/       Wine patches for turbo graphics (from Neutron)
 wrapper/                   the steamwebhelper wrapper (source and prebuilt .exe)
 tests/                     Linux Wine tests with small Windows test programs
 scripts/package.sh         builds dist/Burrow-<version>.zip
+Make DMG.command           builds ~/Desktop/DMGs/Burrow-<version>.dmg on a Mac
+Set Up Signing.command     once per Mac: Developer ID certificate and notary login for the DMGs
+dmg/                       DMG build: stage.sh, make-dmg.sh, window background, Read Me
 ```
 
 `tests/run-tests.sh` runs Burrow against Linux Wine with small Windows test programs
