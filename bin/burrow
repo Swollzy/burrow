@@ -7,7 +7,7 @@
 # no mapfile. Run `burrow help` for the commands.
 set -u
 
-BURROW_VERSION="0.3.4"
+BURROW_VERSION="0.3.5"
 
 # --- Paths and pinned downloads -------------------------------------------------------
 BURROW_HOME="${BURROW_HOME:-$HOME/Library/Application Support/Burrow}"
@@ -37,7 +37,8 @@ WINE_RELEASE_API="https://api.github.com/repos/Gcenx/macOS_Wine_builds/releases/
 DXMT_VERSION="${BURROW_DXMT_VERSION:-v0.80}"
 DXMT_URL="${BURROW_DXMT_URL:-https://github.com/3Shain/dxmt/releases/download/$DXMT_VERSION/dxmt-$DXMT_VERSION-builtin.tar.gz}"
 DXMT_RELEASE_API="https://api.github.com/repos/3Shain/dxmt/releases/tags/$DXMT_VERSION"
-STEAM_SETUP_URL="${BURROW_STEAM_URL:-https://cdn.cloudflare.steamstatic.com/client/installer/SteamSetup.exe}"
+# Burrow doesn't fetch Steam: you download SteamSetup.exe from Valve and Burrow installs it.
+STEAM_GET_URL="https://store.steampowered.com/about/"
 STEAM_BOTTLE="Steam"
 STEAM_DIR_WIN='C:\Program Files (x86)\Steam'
 STEAM_REL="drive_c/Program Files (x86)/Steam"
@@ -1075,6 +1076,12 @@ cmd_install() { # installer [--bottle B] [--name N] [--preset P]
   [ -f "$installer" ] || die "no such file: $installer"
   # The installer runs from its own folder, so a relative path has to be made absolute first.
   installer="$(cd "$(dirname "$installer")" && pwd)/$(basename "$installer")"
+  # Steam's installer goes in the Steam bottle, where Burrow's Steam fixes are.
+  if [ -z "$bottle" ]; then
+    case "$(basename "$installer" | tr '[:upper:]' '[:lower:]')" in
+      steamsetup*.exe) cmd_steam_install "$installer"; return ;;
+    esac
+  fi
   local base; base=$(basename "$installer"); base="${base%.*}"
   [ -n "$bottle" ] || bottle="${name:-$base}"
   if ! bottle_exists "$bottle"; then cmd_bottle_create "$bottle" "$preset"
@@ -1238,17 +1245,27 @@ watch_webhelpers() { # runs in the background until the bottle's wineserver exit
   rm -f "$done_flag"
 }
 
-cmd_steam_install() {
+steam_installed() { [ -f "$(steam_root)/steam.exe" ] || [ -f "$(steam_root)/Steam.exe" ]; }
+
+steam_needed() {
+  die "Windows Steam isn't installed. Download SteamSetup.exe from Valve ($STEAM_GET_URL), then drop it on Burrow, or run: burrow steam install ~/Downloads/SteamSetup.exe"
+}
+
+cmd_steam_install() { # [SteamSetup.exe] (the one in Downloads if not given)
+  local setup="${1:-}"
+  if bottle_exists "$STEAM_BOTTLE" && steam_installed; then ok "Windows Steam is installed"; return 0; fi
+  if [ -z "$setup" ]; then
+    [ -f "$HOME/Downloads/SteamSetup.exe" ] || steam_needed
+    setup="$HOME/Downloads/SteamSetup.exe"
+  fi
+  [ -f "$setup" ] || die "no such file: $setup"
+  case "$setup" in /*) ;; *) setup="$PWD/$setup" ;; esac
   bottle_exists "$STEAM_BOTTLE" || cmd_bottle_create "$STEAM_BOTTLE" gaming
   use_bottle "$STEAM_BOTTLE"
-  if [ -f "$(steam_root)/steam.exe" ] || [ -f "$(steam_root)/Steam.exe" ]; then ok "Windows Steam is installed"; return 0; fi
-  local setup="$CACHE/SteamSetup.exe"
-  step "Downloading Steam's Windows installer from Valve…"
-  download "$STEAM_SETUP_URL" "$setup" || die "couldn't download SteamSetup.exe"
-  step "Installing Windows Steam…"
+  step "Installing Windows Steam from $(basename "$setup")…"
   "$WINE" "$setup" /S >"$(new_log steam-install)" 2>&1
   "$WINESERVER" -w 2>/dev/null
-  [ -f "$(steam_root)/steam.exe" ] || [ -f "$(steam_root)/Steam.exe" ] || die "Steam didn't install; see the log in $LOGS"
+  steam_installed || die "Steam didn't install from $(basename "$setup"); see the log in $LOGS"
   # Steam adds itself to Windows startup; Wine would then start it without our fixes.
   "$WINE" reg delete 'HKCU\Software\Microsoft\Windows\CurrentVersion\Run' /v Steam /f >/dev/null 2>&1
   "$WINESERVER" -w 2>/dev/null
@@ -1269,7 +1286,7 @@ steam_running() {
 }
 
 cmd_steam_open() { # [extra steam args]
-  cmd_steam_install
+  bottle_exists "$STEAM_BOTTLE" && steam_installed || steam_needed
   use_bottle "$STEAM_BOTTLE" "${BURROW_STEAM_GRAPHICS:-auto}"
   if steam_running; then
     # Hand the request to the running Steam (it forwards -applaunch etc. to itself).
@@ -1373,12 +1390,12 @@ cmd_steam() {
   local sub="${1:-open}"; shift || true
   case "$sub" in
     open|start) cmd_steam_open "$@" ;;
-    install) cmd_steam_install ;;
+    install) cmd_steam_install "$@" ;;
     games) cmd_steam_games "$@" ;;
     sync) cmd_steam_sync ;;
     play|launch) cmd_steam_play "$@" ;;
-    fix) cmd_steam_install; wrap_webhelpers ;;
-    *) die "unknown: burrow steam $sub (open, games, play, sync, fix)" ;;
+    fix) bottle_exists "$STEAM_BOTTLE" && steam_installed || steam_needed; use_bottle "$STEAM_BOTTLE"; wrap_webhelpers ;;
+    *) die "unknown: burrow steam $sub (open, install, games, play, sync, fix)" ;;
   esac
 }
 
@@ -1741,7 +1758,7 @@ cmd_doctor() {
   elif engine_ok "$TURBO_ENGINE"; then ok "Turbo graphics built"
   else warn "Turbo graphics not built: burrow turbo"; fi
   if bottle_exists "$STEAM_BOTTLE"; then
-    [ -f "$(steam_root)/steam.exe" ] || [ -f "$(steam_root)/Steam.exe" ] && ok "Windows Steam installed" || warn "Steam bottle exists but Steam isn't installed: burrow steam install"
+    steam_installed && ok "Windows Steam installed" || warn "Steam bottle exists but Steam isn't installed: burrow steam install ~/Downloads/SteamSetup.exe"
     local unwrapped; unwrapped=$(find "$(steam_root)/bin/cef" -name steamwebhelper.exe 2>/dev/null | while IFS= read -r f; do grep -aq "$WRAPPER_MARKER" "$f" || echo "$f"; done)
     [ -z "$unwrapped" ] && ok "Steam window fix in place" || warn "Steam window fix not applied yet (applied on next burrow steam)"
   fi
@@ -1903,7 +1920,8 @@ ${B}Burrow $BURROW_VERSION${N}: Windows programs and Windows Steam on your Mac.
 
   ${B}burrow setup${N}                     download Wine and DXMT (once)
   ${B}burrow turbo${N}                     build fast Metal graphics for 3D games (once)
-  ${B}burrow steam${N}                     install (first time) and open Windows Steam
+  burrow steam install SteamSetup.exe  install Windows Steam from Valve's installer (once)
+  ${B}burrow steam${N}                     open Windows Steam
   burrow steam games               list installed Steam games
   burrow steam play "Schedule I"   start a Steam game
   burrow steam sync                put your Steam games in the library

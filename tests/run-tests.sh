@@ -18,7 +18,7 @@ export BURROW_WINE="$WINEBIN"
 pass=0; fail=0
 check() { if eval "$2"; then echo "ok   $1"; pass=$((pass+1)); else echo "FAIL $1"; fail=$((fail+1)); fi; }
 
-for n in fakeapp fakesteam fakehelper; do
+for n in fakeapp fakesteam fakehelper fakesteamsetup; do
   x86_64-w64-mingw32-gcc -O1 -municode -o "$work/$n.exe" "$here/mocks/$n.c" -lole32 -luuid -lshell32 2>/dev/null || { echo "can't build $n"; exit 1; }
 done
 cp "$work/fakeapp.exe" "$work/fake-setup.exe"
@@ -151,6 +151,17 @@ cp "$work/fakehelper.exe" "$sroot/bin/cef/cef.win64/steamwebhelper.exe"
 "$burrow" steam play schedule >/dev/null 2>&1
 check "re-wrapped after a Steam update" 'grep -aq BURROW-WEBHELPER-WRAPPER-1 "$sroot/bin/cef/cef.win64/steamwebhelper.exe"'
 check "steam play by name uses -applaunch" 'tr -d "\000" < "$st/steam.txt" | grep -q -- "-applaunch 3164500"'
+cp "$work/fakeapp.exe" "$work/SteamSetup.exe"
+check "installing SteamSetup.exe goes to the Steam bottle" '"$burrow" install "$work/SteamSetup.exe" 2>&1 | grep -q "Windows Steam is installed" && [ ! -d "$BURROW_HOME/bottles/SteamSetup" ]'
+
+# Burrow doesn't download Steam: it installs the SteamSetup.exe you got from Valve.
+ns="$work/nosteam"; mkdir -p "$ns/Downloads"
+check "steam install without SteamSetup.exe says where to get it" '! HOME="$ns" BURROW_HOME="$ns/h" "$burrow" steam install > "$work/ns1.txt" 2>&1 && grep -q "store.steampowered.com" "$work/ns1.txt" && [ ! -d "$ns/h/bottles/Steam" ]'
+check "opening Steam before it's installed says how to get it" '! HOME="$ns" BURROW_HOME="$ns/h" "$burrow" steam > "$work/ns2.txt" 2>&1 && grep -q "SteamSetup.exe" "$work/ns2.txt"'
+cp "$work/fakesteamsetup.exe" "$ns/Downloads/SteamSetup.exe"
+HOME="$ns" BURROW_HOME="$ns/h" "$burrow" steam install > "$work/ns3.txt" 2>&1
+check "steam install runs the SteamSetup.exe in Downloads, silently" '[ -f "$ns/h/bottles/Steam/prefix/drive_c/Program Files (x86)/Steam/steam.exe" ] && grep -q "Windows Steam installed" "$work/ns3.txt"'
+HOME="$ns" BURROW_HOME="$ns/h" "$burrow" kill >/dev/null 2>&1
 
 "$burrow" steam sync >/dev/null
 check "steam sync adds games to the library" '"$burrow" apps | grep -q "Schedule I" && "$burrow" apps | grep -q "Data Center"'
