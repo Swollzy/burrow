@@ -4,12 +4,14 @@ Burrow's own code (`bin/`, `app/`, `wrapper/`, `install.sh`, `tests/`, `scripts/
 Kyle (Swollzy), under the MIT license in `LICENSE`.
 
 Burrow does not include Wine, DXMT, Steam or anything from Apple. `burrow setup` downloads
-them from their own projects, under their own licenses:
+Wine and DXMT from their own projects, under their own licenses, and you download Steam from
+Valve yourself:
 
 - **Wine**: LGPL-2.1-or-later. https://www.winehq.org. macOS builds by Gcenx:
   https://github.com/Gcenx/macOS_Wine_builds
 - **DXMT**: v0.80 is MIT (later releases are LGPL). https://github.com/3Shain/dxmt
-- **Steam**: Valve's installer, downloaded from Valve's CDN on your Mac.
+- **Steam**: Valve's installer (`SteamSetup.exe`), which you download from Valve; Burrow only
+  runs it.
 
 Included from other projects:
 

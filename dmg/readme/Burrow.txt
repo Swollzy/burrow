@@ -36,13 +36,12 @@ USING IT
   Windows programs) and sets everything up. That's a few hundred MB.
 - "Turbo graphics" builds a faster engine on your Mac. It needs Apple's
   free Command Line Tools; Burrow offers to install them.
-- Then use the Steam tab to install Windows Steam and your games.
+- For Steam games, download SteamSetup.exe from Valve's site
+  (store.steampowered.com/about) and drop it on the Burrow window.
 
-Burrow doesn't include Wine, DXMT or Steam; it downloads them from their
-own projects. Games that need DirectX 12 or kernel anti-cheat won't run.
-
-To remove Burrow later: Burrow > Settings > Uninstall Burrow. Your games
-stay unless you tick the box to delete them too.
+Burrow doesn't include Wine, DXMT or Steam. It downloads Wine and DXMT
+from their own projects, and Steam comes from Valve's own installer.
+Games that need DirectX 12 or kernel anti-cheat won't run.
 
 Needs macOS 13 Ventura or newer. {{MACS}}
 On Intel Macs turbo graphics isn't available, so stick to older or 2D games.

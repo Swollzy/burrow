@@ -382,12 +382,11 @@ final class BurrowModel: ObservableObject {
     }
 
     /// A long job: its title in the console, burrow's arguments, what a notification says when it
-    /// works (given what it printed), whether it notifies at all, and what to do after it works.
+    /// works (given what it printed), and what to do after it works.
     struct Job {
         let title: String
         let args: [String]
         var done: ((String) -> JobNotice)?
-        var notifies = true
         var then: (() -> Void)?
     }
 
@@ -413,8 +412,8 @@ final class BurrowModel: ObservableObject {
 
     /// Runs a long job and streams its output into the console sheet.
     func runJob(_ title: String, _ args: [String], done: ((String) -> JobNotice)? = nil,
-                notifies: Bool = true, then: (() -> Void)? = nil) {
-        let job = Job(title: title, args: args, done: done, notifies: notifies, then: then)
+                then: (() -> Void)? = nil) {
+        let job = Job(title: title, args: args, done: done, then: then)
         if jobRunning {
             queuedJobs.append(job)
             consoleText += "\n⏳ \(title) starts when this finishes."
@@ -440,7 +439,7 @@ final class BurrowModel: ObservableObject {
         consoleText = keepText ? consoleText + "\n\n── \(title) ──\n" : ""
         let outputStart = consoleText.utf16.count
         let started = Date()
-        if job.notifies { Notifier.shared.askIfNeeded() }
+        Notifier.shared.askIfNeeded()
         lastJobFailed = false
         failedJobTitle = nil
         stopRequested = false
@@ -496,11 +495,9 @@ final class BurrowModel: ObservableObject {
                 }
                 self.refreshAll()
                 let failed = self.lastJobFailed
-                if job.notifies {
-                    let output = self.jobOutput(since: outputStart)
-                    Notifier.shared.jobEnded(title, failed: failed, seconds: Date().timeIntervalSince(started),
-                                             notice: failed ? nil : job.done?(output), error: BurrowModel.lastError(in: output))
-                }
+                let output = self.jobOutput(since: outputStart)
+                Notifier.shared.jobEnded(title, failed: failed, seconds: Date().timeIntervalSince(started),
+                                         notice: failed ? nil : job.done?(output), error: BurrowModel.lastError(in: output))
                 if !failed { job.then?() }
                 self.startNextJob(afterFailure: failed)
             }
@@ -530,72 +527,6 @@ final class BurrowModel: ObservableObject {
               let r = line.range(of: "error:") else { return nil }
         let text = line[r.upperBound...].trimmingCharacters(in: .whitespaces)
         return text.isEmpty ? nil : String(text.prefix(180))
-    }
-
-    // MARK: Uninstalling
-
-    /// Uninstall Burrow…: asks (and asks again before deleting games), runs `burrow uninstall`,
-    /// moves this app to the Trash and quits.
-    func uninstall() {
-        guard !jobBusy else {
-            alertText = "\(consoleTitle) is still running. Let it finish (or stop it), then uninstall."
-            return
-        }
-        let bottleKB = disk.filter { $0.kind == "bottle" }.reduce(0.0) { $0 + $1.kb }
-        let size = bottleKB > 0 ? " (\(humanKB(bottleKB)))" : ""
-        let ask = NSAlert()
-        ask.alertStyle = .warning
-        ask.messageText = "Uninstall Burrow?"
-        ask.informativeText = "This removes Wine, the downloads, logs, Dock shortcuts and Burrow itself (to the Trash).\n\n"
-            + "Your bottles hold your installed Windows games and programs, and their saves\(size). They stay, "
-            + "so installing Burrow again brings them back, unless you tick the box below."
-        ask.addButton(withTitle: "Uninstall")
-        ask.addButton(withTitle: "Cancel")
-        ask.showsSuppressionButton = true
-        ask.suppressionButton?.title = "Also delete my games and bottles"
-        guard ask.runModal() == .alertFirstButtonReturn else { return }
-        let everything = ask.suppressionButton?.state == .on
-        if everything {
-            let sure = NSAlert()
-            sure.alertStyle = .critical
-            sure.messageText = "Delete all your Windows games and their saves?"
-            sure.informativeText = "Every bottle goes, Steam's included\(size). Saves that aren't in the cloud are lost for good."
-            sure.addButton(withTitle: "Delete Games and Uninstall")
-            sure.addButton(withTitle: "Cancel")
-            // Return means Cancel here; deleting takes a click.
-            sure.buttons[0].hasDestructiveAction = true
-            sure.buttons[0].keyEquivalent = ""
-            sure.buttons[1].keyEquivalent = "\r"
-            guard sure.runModal() == .alertFirstButtonReturn else { return }
-        }
-        var args = ["uninstall", "--yes", "--keep-app", Bundle.main.bundlePath]
-        if everything { args.append("--everything") }
-        runJob("Uninstalling Burrow", args, notifies: false) { [weak self] in self?.finishUninstall(everything: everything) }
-    }
-
-    private func finishUninstall(everything: Bool) {
-        Notifier.shared.forgetAll()
-        NSApp.dockTile.badgeLabel = nil
-        let bundle = Bundle.main.bundleURL
-        let trashed = bundle.pathExtension == "app" && (try? FileManager.default.trashItem(at: bundle, resultingItemURL: nil)) != nil
-        let done = NSAlert()
-        done.messageText = "Burrow is uninstalled."
-        var info = everything ? "Its bottles and games are deleted too." : "Your bottles and games are still in \(home). Install Burrow again to play them, or delete that folder to free the space."
-        if !trashed { info += "\n\nDrag Burrow to the Trash to finish." }
-        done.informativeText = info
-        done.addButton(withTitle: "Quit")
-        done.runModal()
-        // Settings and window state the app writes as it quits go once it has.
-        if let id = Bundle.main.bundleIdentifier {
-            UserDefaults.standard.removePersistentDomain(forName: id)
-            let tidy = Process()
-            tidy.executableURL = URL(fileURLWithPath: "/bin/sh")
-            tidy.arguments = ["-c", "while kill -0 \"$1\" 2>/dev/null; do sleep 0.5; done; defaults delete \"$2\" >/dev/null 2>&1; "
-                + "rm -rf \"$HOME/Library/Saved Application State/$2.savedState\" \"$HOME/Library/Caches/$2\"",
-                              "tidy", String(ProcessInfo.processInfo.processIdentifier), id]
-            try? tidy.run()
-        }
-        NSApp.terminate(nil)
     }
 
     // MARK: Refreshing
@@ -728,7 +659,7 @@ final class BurrowModel: ObservableObject {
         }
         // Steam's own installer belongs in the Steam bottle, where the Steam tab and its fixes are.
         if url.lastPathComponent.lowercased().hasPrefix("steamsetup") {
-            if status.has("steam") { openSteam() } else { installSteam() }
+            if status.has("steam") { openSteam() } else { installSteam(from: url) }
             return
         }
         present(.install(url, nil))
@@ -800,8 +731,15 @@ final class BurrowModel: ObservableObject {
 
     func openSteam() { fire(["steam"]) }
 
-    func installSteam() {
-        runJob("Installing Windows Steam", ["steam", "install"],
+    /// Burrow doesn't download Steam: you get SteamSetup.exe from Valve, and Burrow installs it
+    /// into the Steam bottle with its fixes.
+    static let steamDownloadPage = URL(string: "https://store.steampowered.com/about/")!
+
+    func getSteam() { NSWorkspace.shared.open(BurrowModel.steamDownloadPage) }
+
+    func installSteam(from setup: URL? = nil) {
+        guard let url = setup ?? pickWindowsFile("Pick SteamSetup.exe (from Valve's Steam page)", types: ["exe"]) else { return }
+        runJob("Installing Windows Steam", ["steam", "install", url.path],
                done: { _ in JobNotice(title: "Windows Steam is installed", body: "Steam is opening. Sign in to get your games.") }) { [weak self] in
             self?.openSteam()
         }
@@ -1046,14 +984,14 @@ struct BurrowApp: App {
         }
         // Burrow > Settings… (⌘,)
         Settings {
-            AppSettingsView().environmentObject(model)
+            AppSettingsView()
         }
     }
 }
 
-/// Burrow > Settings: notifications, and uninstalling Burrow.
+/// Burrow > Settings: notifications. (No Uninstall here: Burrow goes by dragging it to the Trash,
+/// and `burrow uninstall` in Terminal clears Wine and the downloads too.)
 struct AppSettingsView: View {
-    @EnvironmentObject var model: BurrowModel
     @ObservedObject private var notifier = Notifier.shared
     @AppStorage(Notifier.enabledKey) private var notify = true
 
@@ -1069,15 +1007,6 @@ struct AppSettingsView: View {
                         Spacer()
                         Button("Open Notification Settings") { Notifier.openSystemSettings() }
                     }
-                }
-            }
-            Section("Uninstall") {
-                Text("Removes Wine, the downloads, logs, Dock shortcuts and Burrow itself. Your bottles (installed games and their saves) stay unless you choose to delete them.")
-                    .font(.callout).foregroundColor(.secondary).fixedSize(horizontal: false, vertical: true)
-                HStack {
-                    Spacer()
-                    Button("Uninstall Burrow…") { model.uninstall() }
-                        .disabled(model.jobBusy)
                 }
             }
         }
@@ -1295,10 +1224,14 @@ struct SteamView: View {
                 Spacer()
             } else if !model.status.has("steam") {
                 VStack(alignment: .leading, spacing: 8) {
-                    Text("Burrow downloads Steam's Windows installer from Valve and puts it in its own bottle. Then sign in and install games like you would on a PC.")
+                    Text("Download Steam's Windows installer (SteamSetup.exe) from Valve, then install it here or drop it on this window. Burrow puts it in its own bottle with the fixes it needs. Then sign in and install games like you would on a PC.")
                         .fixedSize(horizontal: false, vertical: true)
-                    Button { model.installSteam() } label: { Label("Install Windows Steam", systemImage: "arrow.down.circle") }
-                        .controlSize(.large)
+                    HStack {
+                        Button { model.getSteam() } label: { Label("Get SteamSetup.exe from Valve", systemImage: "safari") }
+                        Button { model.installSteam() } label: { Label("Install from SteamSetup.exe…", systemImage: "arrow.down.circle") }
+                            .keyboardShortcut(.defaultAction)
+                    }
+                    .controlSize(.large)
                 }
                 Spacer()
             } else {
@@ -1493,8 +1426,9 @@ struct SetupView: View {
                     }
                 }
                 StepRow(done: model.status.has("steam"), title: "Windows Steam",
-                        detail: "Installs Steam from Valve into its own bottle.") {
-                    Button("Install") { model.installSteam() }.disabled(!model.status.has("setup"))
+                        detail: "Get SteamSetup.exe from Valve, then Burrow installs it into its own bottle.") {
+                    Button("Get It") { model.getSteam() }
+                    Button("Install…") { model.installSteam() }.disabled(!model.status.has("setup"))
                 }
                 StepRow(done: model.status.has("gst"), title: "GStreamer (optional)",
                         detail: "Lets game intro videos play. Get the macOS runtime installer.") {
@@ -1511,7 +1445,7 @@ struct SetupView: View {
                     Button("Refresh") { model.refreshAll() }
                     Spacer()
                     OpenSettingsButton()
-                        .help("Notifications, and uninstalling Burrow.")
+                        .help("Notifications.")
                 }
             }
             .padding(.vertical, 4)

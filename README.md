@@ -38,8 +38,10 @@ downloads from their own sites during setup:
 5. Install Windows programs inside Burrow: drop an installer (`.exe` or `.msi`) on the
    window, press ⌘O, or right-click it in Finder and choose **Open With > Burrow**. Burrow
    asks which bottle it goes in and which preset to use, then runs it.
-6. For Steam games, install Windows Steam (Steam or Setup tab), sign in and install your
-   games, press "Add Games to Library", then play them from **Library**.
+6. For Steam games, download Steam's Windows installer (`SteamSetup.exe`) from
+   [Valve](https://store.steampowered.com/about/) and drop it on Burrow (or use **Install from
+   SteamSetup.exe…** on the Steam tab). Burrow puts it in the `Steam` bottle with its fixes. Sign
+   in and install your games, press "Add Games to Library", then play them from **Library**.
 
 The window has five tabs:
 
@@ -49,13 +51,14 @@ The window has five tabs:
 - **Bottles**: each Windows install, like a lightweight VM. Open one as a whole Windows
   desktop in a window, change its settings or preset, take and restore snapshots, install
   Windows components, run a program once, duplicate it, or delete it.
-- **Steam**: install or open Windows Steam, list installed games, play one.
+- **Steam**: install Windows Steam from a `SteamSetup.exe` you downloaded, open it, list
+  installed games, play one.
 - **Usage**: disk space for each bottle, each Steam game, Wine and downloads, plus free
   space on your Mac (orange under 20 GB); and live memory (RAM) for every running Windows
   program, grouped by bottle, with Quit buttons.
 - **Setup**: each step with a check mark, plus "Check Everything" and the logs folder.
 
-**Burrow > Settings** (⌘,) turns notifications on or off and has **Uninstall Burrow…**.
+**Burrow > Settings** (⌘,) turns notifications on or off.
 
 - **Notifications**: when Wine setup, the turbo build, an install or another long job finishes
   or stops with an error while you're in another app, Burrow says so in Notification Center
@@ -104,13 +107,14 @@ are running. Run it yourself with `burrow cleanup` (`--dry-run` lists what it wo
 
 ## Uninstalling
 
-**Burrow > Settings > Uninstall Burrow…**, or `burrow uninstall` in Terminal (`--dry-run` lists
-what it would remove). It removes Wine, DXMT and winetricks, the downloads and turbo build
-files, logs, the `burrow` command, Dock shortcuts, the window's settings, the permissions macOS
-gave Burrow, and Burrow.app (to the Trash). Your bottles hold your installed games and their
-saves, so they stay, with the library and snapshots: installing Burrow again brings them back.
-Tick **Also delete my games and bottles** (asked twice), or add `--everything`, to delete those
-too. Windows programs have to be closed first.
+Drag Burrow to the Trash, like any Mac app. That leaves Wine, the downloads and your bottles in
+`~/Library/Application Support/Burrow`. To clear those too, run `burrow uninstall` in Terminal
+(`--dry-run` lists what it would remove). It removes Wine, DXMT and winetricks, the downloads
+and turbo build files, logs, the `burrow` command, Dock shortcuts, the window's settings, the
+permissions macOS gave Burrow, and Burrow.app (to the Trash). Your bottles hold your installed
+games and their saves, so they stay, with the library and snapshots: installing Burrow again
+brings them back. Add `--everything` to delete those too. Windows programs have to be closed
+first.
 
 ## Bottles: lightweight Windows VMs
 
@@ -185,7 +189,10 @@ simple pick-from-a-list menu and saves the reason in `logs/app-build.log`.
 ```
 burrow setup                   download Wine and DXMT (once)
 burrow turbo                   build fast Metal graphics for 3D games (once)
-burrow steam                   install (first time) and open Windows Steam
+burrow steam install SteamSetup.exe
+                               install Windows Steam from Valve's installer (once; with no
+                               file it uses ~/Downloads/SteamSetup.exe)
+burrow steam                   open Windows Steam
 burrow steam games             list installed Steam games
 burrow steam play "Schedule I" start a Steam game
 burrow steam sync              put your Steam games in the library
@@ -282,6 +289,6 @@ Rebuild the wrapper with:
 
 ## License
 
-Burrow's own code is MIT (see `LICENSE`). Wine, DXMT and Steam are downloaded from their own
-projects at setup time and never bundled; see `NOTICE.md` for credits and the licenses of the
-included Wine patches.
+Burrow's own code is MIT (see `LICENSE`). Wine and DXMT are downloaded from their own projects
+at setup time and never bundled, and Steam comes from Valve's installer, which you download
+yourself; see `NOTICE.md` for credits and the licenses of the included Wine patches.
